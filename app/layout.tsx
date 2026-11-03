@@ -3,8 +3,8 @@ import type { Metadata, Viewport } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'v0 App',
-  description: 'Created with v0',
+  title: 'NagrikSetu | Smart Grievance Redressal',
+  description: 'A transparent digital public grievance portal for citizens and government teams.',
   generator: 'v0.app',
   icons: {
     icon: [
