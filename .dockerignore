@@ -4,6 +4,8 @@
 **/.env
 **/.env.*
 **/node_modules
+**/.next
+**/out
 **/dist
 **/.venv
 **/__pycache__

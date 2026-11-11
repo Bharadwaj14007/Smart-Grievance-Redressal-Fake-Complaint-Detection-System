@@ -1,10 +1,10 @@
-import os
 from typing import Literal, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field
 
 from .analysis import analyze as run_analysis
+from .analysis import model_status
 
 app = FastAPI(
     title="Nagrik Setu AI Service",
@@ -42,6 +42,7 @@ class DuplicateCandidate(BaseModel):
     description: str = Field(min_length=1, max_length=10000)
     categoryId: str
     createdAt: str
+    incidentAt: Optional[str] = None
     location: Optional[Location] = None
     textEmbedding: Optional[list[float]] = None
     perceptualHashes: list[str] = Field(default_factory=list)
@@ -65,12 +66,10 @@ class ComplaintInput(BaseModel):
 
 @app.get("/healthz")
 def health():
+    models = model_status()
     return {
         "status": "ok",
-        "models": {
-            "text": os.getenv("TEXT_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
-            "image": os.getenv("IMAGE_MODEL_NAME", "google/vit-base-patch16-224"),
-        },
+        "models": models,
         "inference": "lazy-loaded",
     }
 

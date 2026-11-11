@@ -12,6 +12,7 @@ import {
   Gauge,
   LayoutDashboard,
   LogOut,
+  Mail,
   MapPin,
   Menu,
   MessageSquareText,
@@ -84,6 +85,7 @@ const navConfig = {
     { label: 'AI Monitoring', to: '/admin/ai', icon: Sparkles },
     { label: 'Duplicate Detection', to: '/admin/duplicates', icon: AlertTriangle },
     { label: 'Notifications', to: '/admin/notifications', icon: Bell },
+    { label: 'Delivery Log', to: '/admin/notification-deliveries', icon: Mail },
     { label: 'Citizens', to: '/admin/citizens', icon: Users },
     { label: 'Officers', to: '/admin/officers', icon: ShieldCheck },
     { label: 'Departments', to: '/admin/departments', icon: Building2 },
@@ -655,6 +657,7 @@ function DashboardLayout({ role }: { role: Role }) {
                 <Route path="assigned" element={<OfficerAssignments />} />
                 <Route path="complaint" element={<TrackComplaint />} />
                 <Route path="notifications" element={<PortalNotifications />} />
+                <Route path="notification-deliveries" element={<AdminNotificationDeliveries />} />
                 <Route path="reports" element={<OfficerReports />} />
                 <Route path="profile" element={<CitizenProfile />} />
               </> : null}
@@ -1235,6 +1238,13 @@ function TrackComplaint() {
     enabled: !isDemoMode && Boolean(selectedId),
     retry: false,
   })
+  const analysisQuery = useQuery({
+    queryKey: ['complaint-ai-analysis', selectedId],
+    queryFn: () => complaintService.getAIAnalysis(selectedId),
+    enabled: !isDemoMode && Boolean(selectedId),
+    refetchInterval: (query) => ['QUEUED', 'PROCESSING'].includes(query.state.data?.latest.status ?? '') ? 3000 : false,
+    retry: false,
+  })
   const selectedComplaint = isDemoMode ? cachedComplaint : detailQuery.data ?? cachedComplaint
   const [images, setImages] = useState<string[]>([])
   const [resolutionImages, setResolutionImages] = useState<string[]>([])
@@ -1285,6 +1295,8 @@ function TrackComplaint() {
   }, [selectedComplaint?.recordId, selectedComplaint?.imageIds, selectedComplaint?.resolutionEvidenceIds])
   const complaintImages = isDemoMode ? selectedComplaint?.images ?? [] : images
   const complaintResolutionImages = isDemoMode ? selectedComplaint?.resolutionImages ?? [] : resolutionImages
+  const analysis = analysisQuery.data?.latest
+  const analysisResult = analysis?.result
 
   const submitFeedback = async () => {
     if (!selectedComplaint) return
@@ -1370,9 +1382,34 @@ function TrackComplaint() {
                 {complaintImages.length ? <div className="mt-3 grid grid-cols-2 gap-2">{complaintImages.map((image, index) => <img key={`${selectedComplaint.id}-${index}`} src={image} alt={`Evidence ${index + 1}`} className="h-28 w-full rounded-lg object-cover" />)}</div> : <p className="mt-3 text-sm text-slate-500">{imagesLoading ? 'Loading evidence images…' : selectedComplaint.imageIds?.length ? 'Evidence images are unavailable.' : 'No evidence images attached.'}</p>}
                 {complaintResolutionImages.length ? <div className="mt-4"><div className="text-xs font-semibold text-slate-600">Resolution evidence</div><div className="mt-2 grid grid-cols-2 gap-2">{complaintResolutionImages.map((image, index) => <img key={`${selectedComplaint.id}-resolution-${index}`} src={image} alt={`Resolution evidence ${index + 1}`} className="h-28 w-full rounded-lg object-cover" />)}</div></div> : null}
                 <div className="mt-4 rounded-xl border border-sky-200 bg-sky-50 p-4 text-sm">
-                  <div className="font-semibold text-slate-800">Automated analysis status</div>
-                  <div className="mt-2 text-slate-600">{selectedComplaint.aiStatus ?? 'NOT_CONFIGURED'}</div>
-                  <div className="mt-1 text-xs text-slate-600">No confidence or risk score is available unless an analysis service is configured.</div>
+                  <div className="font-semibold text-slate-800">AI analysis</div>
+                  <div className="mt-2 text-slate-600">{analysis?.status ?? selectedComplaint.aiStatus ?? 'NOT_CONFIGURED'}</div>
+                  {analysisQuery.isError ? <div role="alert" className="mt-2 text-xs text-red-700">{getApiErrorMessage(analysisQuery.error, 'Analysis details are unavailable.')}</div> : null}
+                  {analysisResult ? <>
+                    {analysisResult.predictedCategory ? <div className="mt-2 text-xs text-slate-700">Predicted category: <span className="font-semibold">{analysisResult.predictedCategory.name}</span> · cosine similarity {analysisResult.predictedCategory.similarity.toFixed(3)}</div> : null}
+                    {analysisResult.recommendedDepartment ? <div className="mt-1 text-xs text-slate-700">Recommended department: {analysisResult.recommendedDepartment}</div> : null}
+                    {analysisResult.recommendedPriority ? <div className="mt-1 text-xs text-slate-700">Priority recommendation: {analysisResult.recommendedPriority.value} · {analysisResult.recommendedPriority.method}</div> : null}
+                    {analysisResult.recommendedPriority?.reasons.map((reason) => <div key={reason} className="mt-1 text-xs text-slate-600">{reason}</div>)}
+                    {analysisResult.model ? <div className="mt-2 text-[11px] text-slate-500">Models: {[analysisResult.model.text, analysisResult.model.image].filter(Boolean).map((model) => `${model?.name}@${model?.revision}`).join(' · ')}</div> : null}
+                    {analysisResult.images?.map((image) => <div key={image.id} className="mt-3 border-t border-sky-200 pt-2">
+                      <div className="text-xs font-semibold text-slate-700">Image {image.width} × {image.height} · ELA difference {image.elaMeanDifference.toFixed(2)}</div>
+                      {image.classification.slice(0, 3).map((item) => <div key={item.label} className="mt-1 text-xs text-slate-600">{item.label} · {(item.score * 100).toFixed(1)}% classifier score</div>)}
+                      {image.forensicIndicators.map((indicator) => <div key={indicator} className="mt-1 text-xs text-amber-800">{indicator}</div>)}
+                    </div>)}
+                    {session?.role === 'admin' && analysisResult.duplicateCandidates?.length ? <div className="mt-3 border-t border-sky-200 pt-2">
+                      <div className="text-xs font-semibold text-slate-700">AI duplicate candidates</div>
+                      {analysisResult.duplicateCandidates.map((candidate) => <div key={candidate.complaintId} className="mt-1 text-xs text-slate-600">
+                        {candidate.trackingId} · {(candidate.similarity * 100).toFixed(1)}% heuristic similarity
+                        <div className="text-[11px]">{candidate.signals.map((signal) => `${signal.name}: ${signal.value.toFixed(3)}${signal.normalizedValue === undefined ? '' : ` (normalized ${signal.normalizedValue.toFixed(3)})`}`).join(' · ')}</div>
+                      </div>)}
+                      <button onClick={() => void analysisQuery.refetch()} className="mt-2 text-xs font-semibold text-blue-700">Refresh analysis details</button>
+                    </div> : null}
+                    {analysisResult.disclaimer ? <div className="mt-2 text-[11px] text-slate-500">{analysisResult.disclaimer}</div> : null}
+                  </> : analysis?.status === 'COMPLETED' && session?.role === 'citizen'
+                    ? <div className="mt-2 text-xs text-slate-600">Analysis is complete. Detailed review signals are restricted to authorized staff.</div>
+                    : analysis?.status === 'NOT_CONFIGURED'
+                      ? <div className="mt-1 text-xs text-slate-600">AI analysis is not configured. Complaint handling continues without AI results.</div>
+                      : null}
                 </div>
               </section>
             </div>
@@ -1758,25 +1795,51 @@ function DuplicateReview() {
   const [decision, setDecision] = useState<'linked' | 'separate' | 'manual-review'>('manual-review')
   const [notes, setNotes] = useState('')
   const [busy, setBusy] = useState(false)
-  const [recentReviews, setRecentReviews] = useState<{ source: string; candidate: string; decision: string; notes?: string | null; reviewer?: string; createdAt?: string }[]>([])
-  const candidates = complaints.filter((item) => item.id !== sourceId)
+  const [demoReviews, setDemoReviews] = useState<{ source: string; candidate: string; decision: string; notes?: string; createdAt: string }[]>([])
+  const duplicateQuery = useQuery({
+    queryKey: ['duplicate-review', sourceId],
+    queryFn: () => complaintService.getDuplicateReviews(sourceId),
+    enabled: Boolean(sourceId) && !isDemoMode,
+    retry: false,
+  })
+  const data = duplicateQuery.data
+  const candidates = data?.candidates ?? []
+  const generatedCandidate = candidates.find((candidate) => candidate.id === candidateId)
+  const manualCandidate = complaints.find((complaint) => complaint.recordId === candidateId || complaint.id === candidateId)
+  const [candidateImageUrls, setCandidateImageUrls] = useState<string[]>([])
 
   useEffect(() => {
     let active = true
-    setRecentReviews([])
-    if (!sourceId || isDemoMode) return () => { active = false }
-    void complaintService.getDuplicateReviews(sourceId).then((reviews) => {
-      if (active) setRecentReviews(reviews.map((review) => ({
-        source: review.complaint.trackingId,
-        candidate: review.candidate.trackingId,
-        decision: review.decision,
-        notes: review.notes,
-        reviewer: review.reviewer.email,
-        createdAt: review.createdAt,
-      })))
-    }).catch((error: unknown) => toast.error(getApiErrorMessage(error, 'Duplicate review history could not be loaded.')))
-    return () => { active = false }
-  }, [sourceId])
+    let urls: string[] = []
+    setCandidateImageUrls([])
+    if (!generatedCandidate?.images.length) return () => { active = false }
+    void Promise.all(generatedCandidate.images.map(async (image) => {
+      try {
+        return await complaintService.fetchComplaintImage(generatedCandidate.id, image.id)
+      } catch {
+        return null
+      }
+    })).then((results) => {
+      urls = results.filter((url): url is string => Boolean(url))
+      if (active) setCandidateImageUrls(urls)
+      else urls.forEach((url) => URL.revokeObjectURL(url))
+    })
+    return () => {
+      active = false
+      urls.forEach((url) => URL.revokeObjectURL(url))
+    }
+  }, [generatedCandidate?.id, generatedCandidate?.images])
+
+  const recentReviews = isDemoMode
+    ? demoReviews.map((review) => ({ ...review, reviewer: undefined }))
+    : (data?.reviews ?? []).map((review) => ({
+      source: review.complaint.trackingId,
+      candidate: review.candidate.trackingId,
+      decision: review.decision,
+      notes: review.notes,
+      reviewer: review.reviewer.email,
+      createdAt: review.createdAt,
+    }))
 
   const submitReview = async () => {
     if (!sourceId || !candidateId) {
@@ -1786,21 +1849,18 @@ function DuplicateReview() {
     setBusy(true)
     try {
       await complaintService.reviewDuplicate(sourceId, decision, candidateId, notes.trim() || undefined)
-      const source = complaints.find((item) => item.id === sourceId)
-      const candidate = complaints.find((item) => item.id === candidateId)
       if (isDemoMode) {
-        setRecentReviews((items) => [{ source: source?.id ?? sourceId, candidate: candidate?.id ?? candidateId, decision, notes: notes.trim() || undefined }, ...items])
+        setDemoReviews((items) => [{
+          source: sourceId,
+          candidate: generatedCandidate?.trackingId ?? manualCandidate?.id ?? candidateId,
+          decision,
+          notes: notes.trim() || undefined,
+          createdAt: new Date().toISOString(),
+        }, ...items])
       } else {
-        const reviews = await complaintService.getDuplicateReviews(sourceId)
-        setRecentReviews(reviews.map((review) => ({
-          source: review.complaint.trackingId,
-          candidate: review.candidate.trackingId,
-          decision: review.decision,
-          notes: review.notes,
-          reviewer: review.reviewer.email,
-          createdAt: review.createdAt,
-        })))
+        await duplicateQuery.refetch()
       }
+      setCandidateId('')
       setNotes('')
       toast.success('Manual duplicate review recorded.')
     } catch (error) {
@@ -1812,7 +1872,27 @@ function DuplicateReview() {
 
   return (
     <>
-      <SectionHeader eyebrow="Duplicate review" title="Manual duplicate review" description="Automatic duplicate detection is unavailable. Select two existing complaints and record a manual decision; no similarity score or candidate is fabricated." />
+      <SectionHeader eyebrow="Duplicate review" title="Duplicate review" description="Review model-generated candidates and their contributing signals, or record a manual comparison when no candidate is available." />
+      {sourceId && duplicateQuery.isLoading ? <p className="mb-4 text-sm text-slate-500">Loading AI candidates and review history…</p> : null}
+      {duplicateQuery.isError ? <p role="alert" className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">{getApiErrorMessage(duplicateQuery.error, 'AI duplicate candidates could not be loaded.')}</p> : null}
+      {sourceId && data?.analysisStatus === 'NOT_CONFIGURED' ? <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Automatic duplicate analysis is not configured for this complaint. No AI candidates or scores are available.</p> : null}
+      {sourceId && data && !candidates.length && data.analysisStatus === 'COMPLETED' ? <p className="mb-4 rounded-xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">No existing complaints met the configured candidate threshold. This does not establish that the complaint has no duplicate.</p> : null}
+      {candidates.length ? <div className="mb-5 max-w-4xl space-y-3">
+        <h2 className="text-sm font-bold uppercase tracking-[0.12em] text-slate-500">AI-generated candidates</h2>
+        {candidates.map((candidate) => <div key={candidate.id} className={`rounded-2xl border bg-white p-4 shadow-sm ${candidateId === candidate.id ? 'border-blue-400' : 'border-slate-200'}`}>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <button onClick={() => setCandidateId(candidate.id)} className="text-left font-bold text-slate-900">{candidate.trackingId} · {candidate.title}</button>
+              <div className="mt-1 text-xs text-slate-500">{candidate.category.name} · {candidate.incidentAt ? `Incident ${formatDate(candidate.incidentAt)}` : `Submitted ${formatDate(candidate.createdAt)}`}</div>
+              {candidate.location ? <div className="mt-1 text-xs text-slate-500">{candidate.location.address}, {candidate.location.city}, {candidate.location.district}, {candidate.location.state}</div> : null}
+            </div>
+            <div className="rounded-lg bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-800">{(candidate.similarity * 100).toFixed(1)}% heuristic similarity</div>
+          </div>
+          <p className="mt-3 text-sm leading-6 text-slate-600">{candidate.description}</p>
+          <div className="mt-3 flex flex-wrap gap-2">{candidate.signals.map((signal) => <span key={signal.name} className="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-700" title={signal.weight === undefined ? 'Signal weighting was not saved for this analysis.' : `${(signal.weight * 100).toFixed(1)}% of candidate score`}>{signal.name.replace(/_/g, ' ')}: {signal.value.toFixed(3)}{signal.normalizedValue === undefined ? '' : ` · score ${signal.normalizedValue.toFixed(3)}`}</span>)}</div>
+          {candidateId === candidate.id && candidateImageUrls.length ? <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-4">{candidateImageUrls.map((url, index) => <img key={`${candidate.id}-${index}`} src={url} alt={`Candidate evidence ${index + 1}`} className="h-28 w-full rounded-lg object-cover" />)}</div> : null}
+        </div>)}
+      </div> : null}
       <div className="max-w-3xl rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
         <div className="grid gap-4 md:grid-cols-2">
           <label className="text-sm font-medium text-slate-700">Complaint
@@ -1824,7 +1904,10 @@ function DuplicateReview() {
           <label className="text-sm font-medium text-slate-700">Compare with
             <select value={candidateId} onChange={(event) => setCandidateId(event.target.value)} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
               <option value="">Select another complaint</option>
-              {candidates.map((item) => <option key={item.id} value={item.id}>{item.id} · {item.title}</option>)}
+              {candidates.map((candidate) => <option key={candidate.id} value={candidate.id}>AI · {candidate.trackingId} · {candidate.title}</option>)}
+              <optgroup label="Manual comparison">
+                {complaints.filter((item) => item.id !== sourceId && item.recordId && !candidates.some((candidate) => candidate.id === item.recordId)).map((item) => <option key={item.recordId} value={item.recordId}>{item.id} · {item.title}</option>)}
+              </optgroup>
             </select>
           </label>
           <label className="text-sm font-medium text-slate-700">Decision
@@ -1840,6 +1923,7 @@ function DuplicateReview() {
         </div>
         <button disabled={busy || complaints.length < 2} onClick={() => void submitReview()} className="mt-5 rounded-xl bg-navy px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{busy ? 'Saving…' : 'Record review'}</button>
         {complaints.length < 2 ? <p className="mt-3 text-sm text-slate-500">At least two complaints are required for manual comparison.</p> : null}
+        {generatedCandidate ? <p className="mt-3 text-xs text-slate-500">The server will persist the candidate's actual generated score; manually selected comparisons do not receive a similarity score.</p> : null}
       </div>
       {recentReviews.length ? <div className="mt-5 max-w-3xl space-y-2">{recentReviews.map((review, index) => <div key={`${review.source}-${review.candidate}-${review.createdAt ?? index}`} className="rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-700"><div>{review.source} ↔ {review.candidate} · {review.decision.replace(/_/g, ' ').replace('-', ' ')}</div>{review.notes ? <div className="mt-1 text-slate-500">{review.notes}</div> : null}{review.reviewer && review.createdAt ? <div className="mt-1 text-xs text-slate-400">Reviewed by {review.reviewer} · {formatDate(review.createdAt)}</div> : null}</div>)}</div> : sourceId ? <p className="mt-4 max-w-3xl text-sm text-slate-500">No duplicate review history for this complaint.</p> : null}
     </>
@@ -1949,22 +2033,85 @@ function AdminOverview() {
 }
 
 function AdminMonitoring() {
-  const complaints = useAppStore((state) => state.complaints)
+  const navigate = useNavigate()
+  const monitoringQuery = useQuery({
+    queryKey: ['admin-ai-monitoring'],
+    queryFn: adminService.getAIMonitoring,
+    refetchInterval: 5000,
+  })
+  const monitoring = monitoringQuery.data
   const analysisStatuses = ['NOT_CONFIGURED', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED']
-  const statusCounts = analysisStatuses.map((status) => ({
-    status,
-    count: complaints.filter((complaint) => complaint.aiStatus === status).length,
-  }))
+  const statusCounts = analysisStatuses.map((status) => ({ status, count: monitoring?.counts[status] ?? 0 }))
   return (
     <>
-      <SectionHeader eyebrow="AI monitoring" title="Analysis job status" description="Real job states returned for complaints. No model accuracy or risk scores are reported." />
-      <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">The service reports NOT_CONFIGURED until an AI provider and worker are enabled. Complaint handling remains available without AI analysis.</p>
+      <SectionHeader eyebrow="AI monitoring" title="AI analysis monitoring" description="Counts, model health and review signals are loaded from persisted analysis records." action={<button onClick={() => void monitoringQuery.refetch()} className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold">Refresh</button>} />
+      {monitoringQuery.isError ? <p role="alert" className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">{getApiErrorMessage(monitoringQuery.error, 'AI monitoring data could not be loaded.')}</p> : null}
+      {monitoringQuery.isLoading ? <p className="mb-4 text-sm text-slate-500">Loading persisted AI analysis data…</p> : null}
+      {monitoring ? <div className={`mb-4 rounded-xl border p-3 text-sm ${monitoring.modelAvailability.status === 'available' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+        <div className="font-semibold">AI service: {monitoring.modelAvailability.status.replace(/_/g, ' ')}</div>
+        {monitoring.modelAvailability.reason ? <div className="mt-1">{monitoring.modelAvailability.reason}</div> : null}
+        {monitoring.modelAvailability.models ? <div className="mt-2 grid gap-2 sm:grid-cols-2">{Object.entries(monitoring.modelAvailability.models).map(([name, model]) => <div key={name}>{name}: {model.name}@{model.revision} · {model.loaded ? 'loaded' : 'not yet loaded'}</div>)}</div> : null}
+      </div> : null}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         {statusCounts.map(({ status, count }) => <div key={status} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
           <div className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">{status.replace('_', ' ')}</div>
           <div className="mt-3 text-3xl font-black tracking-[-0.05em] text-slate-900">{count}</div>
         </div>)}
       </div>
+      {monitoring?.recentAnalyses.length ? <div className="mt-6 space-y-3">
+        <h2 className="text-lg font-bold text-slate-900">Recent completed analyses</h2>
+        {monitoring.recentAnalyses.map((analysis) => <article key={analysis.id} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <button onClick={() => navigate(`/admin/complaint?complaint=${encodeURIComponent(analysis.complaint.trackingId)}`)} className="font-semibold text-blue-700">{analysis.complaint.trackingId} · {analysis.complaint.title}</button>
+              <div className="mt-1 text-xs text-slate-500">Analyzed {formatDate(analysis.createdAt)}</div>
+            </div>
+            <button onClick={() => navigate(`/admin/duplicates?complaint=${encodeURIComponent(analysis.complaint.trackingId)}`)} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700">Review duplicates</button>
+          </div>
+          <div className="mt-3 grid gap-2 text-sm text-slate-700 sm:grid-cols-2">
+            <div>Category: {analysis.predictedCategory?.name ?? 'No prediction'}</div>
+            <div>Priority: {analysis.recommendedPriority?.value ?? 'No recommendation'}{analysis.recommendedPriority ? ` · ${analysis.recommendedPriority.method}` : ''}</div>
+            <div>Duplicate candidates: {analysis.duplicateCandidates.length}</div>
+            <div>Image indicators: {analysis.imageIndicators.length}</div>
+          </div>
+          {analysis.imageIndicators.length ? <div className="mt-3 space-y-1 text-xs text-amber-800">{analysis.imageIndicators.map((item, index) => <div key={`${item.imageId}-${index}`}>Image {item.imageId}: {item.indicator}</div>)}</div> : null}
+          {analysis.duplicateCandidates.length ? <div className="mt-3 flex flex-wrap gap-2">{analysis.duplicateCandidates.map((candidate) => <span key={candidate.complaintId} className="rounded-full bg-blue-50 px-3 py-1 text-xs text-blue-800">{candidate.trackingId} · {(candidate.similarity * 100).toFixed(1)}% heuristic score</span>)}</div> : null}
+        </article>)}
+      </div> : null}
+    </>
+  )
+}
+
+function AdminNotificationDeliveries() {
+  const [channel, setChannel] = useState('All')
+  const deliveryQuery = useQuery({
+    queryKey: ['notification-deliveries'],
+    queryFn: adminService.getNotificationDeliveries,
+    refetchInterval: 10_000,
+  })
+  const deliveries = (deliveryQuery.data?.items ?? []).filter((item) => channel === 'All' || item.channel === channel)
+  return (
+    <>
+      <SectionHeader eyebrow="Notifications" title="Email and SMS delivery log" description="Provider delivery states and retry errors are persisted by the background worker." action={<div className="flex items-center gap-2"><select value={channel} onChange={(event) => setChannel(event.target.value)} className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"><option>All</option><option>EMAIL</option><option>SMS</option></select><button onClick={() => void deliveryQuery.refetch()} className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold">Refresh</button></div>} />
+      {deliveryQuery.isError ? <p role="alert" className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">{getApiErrorMessage(deliveryQuery.error, 'Notification delivery records could not be loaded.')}</p> : null}
+      {deliveryQuery.isLoading ? <p className="mb-4 text-sm text-slate-500">Loading delivery records…</p> : null}
+      {isDemoMode ? <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Delivery records are not persisted in demo mode.</p> : null}
+      {deliveryQuery.data ? <p className="mb-4 text-sm text-slate-500">Showing {deliveries.length} of {deliveryQuery.data.total} latest provider records.</p> : null}
+      <div className="space-y-3">
+        {deliveries.map((item) => <article key={item.id} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="font-semibold text-slate-900">{item.channel} · {item.notification.type.replace(/_/g, ' ')}</div>
+              <div className="mt-1 text-xs text-slate-500">{item.notification.user.email} · {formatDate(item.updatedAt)}</div>
+            </div>
+            <span className={`rounded-full px-3 py-1 text-xs font-semibold ${item.status === 'DELIVERED' ? 'bg-emerald-100 text-emerald-800' : item.status === 'FAILED' ? 'bg-red-100 text-red-800' : item.status === 'NOT_CONFIGURED' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'}`}>{item.status.replace(/_/g, ' ')}</span>
+          </div>
+          <p className="mt-3 text-sm text-slate-700">{item.notification.message}</p>
+          <div className="mt-2 text-xs text-slate-500">Attempts: {item.attemptCount}{item.providerMessageId ? ` · Provider ID: ${item.providerMessageId}` : ''}</div>
+          {item.error ? <div className="mt-2 rounded-lg bg-red-50 p-2 text-xs text-red-700">{item.error}</div> : null}
+        </article>)}
+      </div>
+      {deliveryQuery.data && !deliveries.length ? <p className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-500">No notification delivery records found.</p> : null}
     </>
   )
 }

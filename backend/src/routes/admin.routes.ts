@@ -1,8 +1,9 @@
 import argon2 from 'argon2'
-import { Priority, Role } from '@prisma/client'
+import { AIJobStatus, NotificationChannel, NotificationDeliveryStatus, Priority, Prisma, Role } from '@prisma/client'
 import { Router } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config/prisma.js'
+import { env } from '../config/env.js'
 import { authenticate, requireRoles } from '../middleware/auth.js'
 import { writeAudit } from '../services/audit.service.js'
 import { assignComplaint } from '../services/complaint.service.js'
@@ -10,6 +11,24 @@ import { asyncHandler, HttpError } from '../utils/errors.js'
 
 export const adminRouter = Router()
 adminRouter.use(authenticate, requireRoles(Role.ADMIN))
+
+const aiCandidateSchema = z.object({
+  complaintId: z.string().uuid(),
+  trackingId: z.string(),
+  similarity: z.number().min(0).max(1),
+  method: z.string().default('legacy_unlabeled'),
+  signals: z.array(z.object({
+    name: z.string(),
+    value: z.number(),
+    normalizedValue: z.number().min(0).max(1).optional(),
+    weight: z.number().min(0).max(1).optional(),
+    contribution: z.number().min(0).max(1).optional(),
+  })),
+})
+
+function analysisResult(value: Prisma.JsonValue | null | undefined) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Prisma.JsonObject : {}
+}
 
 const departmentSchema = z.object({
   name: z.string().trim().min(2).max(160),
@@ -46,6 +65,108 @@ adminRouter.get('/dashboard', asyncHandler(async (_req, res) => {
     prisma.complaint.groupBy({ by: ['categoryId'], _count: { _all: true } }),
   ])
   res.json({ success: true, data: { complaints, citizens, officers, departments, statuses, categories } })
+}))
+
+adminRouter.get('/ai/monitoring', asyncHandler(async (_req, res) => {
+  const [statusGroups, completed] = await Promise.all([
+    prisma.aIAnalysis.groupBy({ by: ['status'], _count: { _all: true } }),
+    prisma.aIAnalysis.findMany({
+      where: { status: AIJobStatus.COMPLETED, result: { not: Prisma.DbNull } },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      select: {
+        id: true,
+        status: true,
+        createdAt: true,
+        complaint: { select: { id: true, trackingId: true, title: true } },
+        result: true,
+      },
+    }),
+  ])
+  let modelAvailability: { status: string; models?: unknown; reason?: string } = {
+    status: env.AI_SERVICE_URL ? 'unreachable' : 'not_configured',
+  }
+  if (env.AI_SERVICE_URL) {
+    try {
+      const response = await fetch(new URL('/healthz', env.AI_SERVICE_URL), { signal: AbortSignal.timeout(2000) })
+      if (response.ok) {
+        const health = await response.json() as { models?: unknown }
+        modelAvailability = { status: 'available', models: health.models }
+      } else {
+        modelAvailability = { status: 'unhealthy', reason: `AI service returned HTTP ${response.status}.` }
+      }
+    } catch {
+      modelAvailability = { status: 'unreachable', reason: 'AI service health check did not succeed.' }
+    }
+  }
+  const counts = Object.fromEntries(statusGroups.map(({ status, _count }) => [status, _count._all]))
+  const recentAnalyses = completed.map((analysis) => {
+    const result = analysisResult(analysis.result)
+    const images = Array.isArray(result.images) ? result.images.filter((image) => image && typeof image === 'object' && !Array.isArray(image)) as Prisma.JsonObject[] : []
+    const candidates = Array.isArray(result.duplicateCandidates)
+      ? result.duplicateCandidates.flatMap((candidate) => {
+        const parsed = aiCandidateSchema.safeParse(candidate)
+        return parsed.success ? [parsed.data] : []
+      })
+      : []
+    const imageIndicators = images.flatMap((image) =>
+      Array.isArray(image.forensicIndicators)
+        ? image.forensicIndicators.filter((indicator): indicator is string => typeof indicator === 'string').map((indicator) => ({ imageId: String(image.id ?? ''), indicator }))
+        : [],
+    )
+    return {
+      id: analysis.id,
+      status: analysis.status,
+      createdAt: analysis.createdAt,
+      complaint: analysis.complaint,
+      model: result.model ?? null,
+      predictedCategory: result.predictedCategory ?? null,
+      recommendedPriority: result.recommendedPriority ?? null,
+      duplicateCandidates: candidates,
+      imageIndicators,
+    }
+  })
+  res.json({ success: true, data: { counts, modelAvailability, recentAnalyses } })
+}))
+
+adminRouter.get('/notification-deliveries', asyncHandler(async (req, res) => {
+  const query = z.object({
+    page: z.coerce.number().int().min(1).default(1),
+    pageSize: z.coerce.number().int().min(1).max(100).default(50),
+    channel: z.nativeEnum(NotificationChannel).optional(),
+    status: z.nativeEnum(NotificationDeliveryStatus).optional(),
+  }).parse(req.query)
+  const where = {
+    ...(query.channel ? { channel: query.channel } : {}),
+    ...(query.status ? { status: query.status } : {}),
+  }
+  const [items, total] = await prisma.$transaction([
+    prisma.notificationDelivery.findMany({
+      where,
+      orderBy: { updatedAt: 'desc' },
+      skip: (query.page - 1) * query.pageSize,
+      take: query.pageSize,
+      select: {
+        id: true,
+        channel: true,
+        status: true,
+        attemptCount: true,
+        providerMessageId: true,
+        error: true,
+        createdAt: true,
+        updatedAt: true,
+        notification: {
+          select: {
+            type: true,
+            message: true,
+            user: { select: { email: true } },
+          },
+        },
+      },
+    }),
+    prisma.notificationDelivery.count({ where }),
+  ])
+  res.json({ success: true, data: { items, total, page: query.page, pageSize: query.pageSize } })
 }))
 adminRouter.get('/citizens', asyncHandler(async (req, res) => {
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : ''
@@ -169,13 +290,33 @@ adminRouter.post('/complaints/:id/duplicate-reviews', asyncHandler(async (req, r
   const input = z.object({
     candidateId: z.string().uuid(),
     decision: z.enum(['LINKED', 'SEPARATE', 'MANUAL_REVIEW']),
-    similarity: z.number().min(0).max(1).optional(),
     notes: z.string().max(4000).optional(),
   }).parse(req.body)
   if (input.candidateId === req.params.id) throw new HttpError(400, 'A complaint cannot be a duplicate of itself.')
+  const [complaint, candidate, latestAnalysis] = await Promise.all([
+    prisma.complaint.findUnique({ where: { id: req.params.id }, select: { id: true } }),
+    prisma.complaint.findUnique({ where: { id: input.candidateId }, select: { id: true } }),
+    prisma.aIAnalysis.findFirst({ where: { complaintId: req.params.id }, orderBy: { createdAt: 'desc' }, select: { status: true, result: true } }),
+  ])
+  if (!complaint || !candidate) throw new HttpError(404, 'Complaint or duplicate candidate not found.')
+  const duplicateCandidates = latestAnalysis?.status === 'COMPLETED' ? analysisResult(latestAnalysis.result).duplicateCandidates : undefined
+  const parsedCandidates = Array.isArray(duplicateCandidates)
+    ? duplicateCandidates.flatMap((item) => {
+      const parsed = aiCandidateSchema.safeParse(item)
+      return parsed.success ? [parsed.data] : []
+    })
+    : []
+  const generatedCandidate = parsedCandidates.find((item) => item.complaintId === input.candidateId)
   const review = await prisma.$transaction(async (tx) => {
     const saved = await tx.duplicateReview.create({
-      data: { complaintId: req.params.id, candidateId: input.candidateId, reviewerId: req.user!.id, decision: input.decision, similarity: input.similarity, notes: input.notes },
+      data: {
+        complaintId: req.params.id,
+        candidateId: input.candidateId,
+        reviewerId: req.user!.id,
+        decision: input.decision,
+        similarity: generatedCandidate?.similarity,
+        notes: input.notes,
+      },
     })
     await tx.auditLog.create({ data: { actorId: req.user!.id, action: 'DUPLICATE_REVIEW_RECORDED', entityType: 'Complaint', entityId: req.params.id, metadata: { candidateId: input.candidateId, decision: input.decision }, ipAddress: req.ip } })
     return saved
@@ -254,9 +395,52 @@ adminRouter.get('/reports.csv', asyncHandler(async (req, res) => {
 }))
 
 adminRouter.get('/complaints/:id/duplicates', asyncHandler(async (req, res) => {
-  const id = req.params.id
-  const complaint = await prisma.complaint.findUnique({ where: { id }, include: { location: true } })
+  const id = z.string().uuid().parse(req.params.id)
+  const complaint = await prisma.complaint.findUnique({ where: { id }, select: { id: true, trackingId: true } })
   if (!complaint) throw new HttpError(404, 'Complaint not found.')
-  const reviews = await prisma.duplicateReview.findMany({ where: { OR: [{ complaintId: id }, { candidateId: id }] }, include: { complaint: { select: { trackingId: true } }, candidate: { select: { trackingId: true } }, reviewer: { select: { email: true } } }, orderBy: { createdAt: 'desc' } })
-  res.json({ success: true, data: { complaintId: complaint.trackingId, reviews } })
+  const [reviews, latestAnalysis] = await Promise.all([
+    prisma.duplicateReview.findMany({
+      where: { OR: [{ complaintId: id }, { candidateId: id }] },
+      include: { complaint: { select: { trackingId: true } }, candidate: { select: { trackingId: true } }, reviewer: { select: { email: true } } },
+      orderBy: { createdAt: 'desc' },
+    }),
+    prisma.aIAnalysis.findFirst({ where: { complaintId: id }, orderBy: { createdAt: 'desc' }, select: { status: true, result: true } }),
+  ])
+  const duplicateCandidates = latestAnalysis?.status === 'COMPLETED' ? analysisResult(latestAnalysis.result).duplicateCandidates : undefined
+  const parsedCandidates = Array.isArray(duplicateCandidates)
+    ? duplicateCandidates.flatMap((item) => {
+      const parsed = aiCandidateSchema.safeParse(item)
+      return parsed.success ? [parsed.data] : []
+    })
+    : []
+  const candidateRecords = parsedCandidates.length
+    ? await prisma.complaint.findMany({
+      where: { id: { in: parsedCandidates.map((item) => item.complaintId) } },
+      select: {
+        id: true,
+        trackingId: true,
+        title: true,
+        description: true,
+        incidentAt: true,
+        createdAt: true,
+        category: { select: { name: true } },
+        location: { select: { address: true, city: true, district: true, state: true, latitude: true, longitude: true } },
+        images: { select: { id: true, contentType: true, sizeBytes: true } },
+      },
+    })
+    : []
+  const byId = new Map(candidateRecords.map((record) => [record.id, record]))
+  const candidates = parsedCandidates.flatMap((candidate) => {
+    const record = byId.get(candidate.complaintId)
+    return record ? [{ ...record, similarity: candidate.similarity, method: candidate.method, signals: candidate.signals }] : []
+  })
+  res.json({
+    success: true,
+    data: {
+      complaintId: complaint.trackingId,
+      analysisStatus: latestAnalysis?.status ?? 'NOT_CONFIGURED',
+      candidates,
+      reviews,
+    },
+  })
 }))

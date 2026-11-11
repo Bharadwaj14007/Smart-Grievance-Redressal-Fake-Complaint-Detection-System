@@ -1,8 +1,28 @@
 import { apiClient } from './api'
+import type { ApiEnvelope } from './api.models'
+import type { AdminAIMonitoring } from './ai.models'
+import type { NotificationDeliveryPage } from './notification.models'
 import { invalidatePortalData } from './queryClient'
 import { isDemoMode, useAppStore } from '../store/useAppStore'
 
 export const adminService = {
+  getAIMonitoring: async (): Promise<AdminAIMonitoring> => {
+    if (isDemoMode) {
+      const counts: Record<string, number> = {}
+      for (const complaint of useAppStore.getState().complaints) {
+        const status = complaint.aiStatus ?? 'NOT_CONFIGURED'
+        counts[status] = (counts[status] ?? 0) + 1
+      }
+      return { counts, modelAvailability: { status: 'not_configured' }, recentAnalyses: [] }
+    }
+    const response = await apiClient.get<ApiEnvelope<AdminAIMonitoring>>('/admin/ai/monitoring')
+    return response.data.data
+  },
+  getNotificationDeliveries: async (): Promise<NotificationDeliveryPage> => {
+    if (isDemoMode) return { items: [], total: 0, page: 1, pageSize: 50 }
+    const response = await apiClient.get<ApiEnvelope<NotificationDeliveryPage>>('/admin/notification-deliveries?page=1&pageSize=50')
+    return response.data.data
+  },
   getDashboardStatistics: () => {
     const state = useAppStore.getState()
     if (state.dashboardStats) return state.dashboardStats

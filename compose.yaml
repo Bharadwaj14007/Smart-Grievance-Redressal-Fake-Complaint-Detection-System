@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgis/postgis:16-3.5
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-nagrik_setu}
       POSTGRES_USER: ${POSTGRES_USER:-nagrik}
@@ -67,6 +67,7 @@ services:
       IMAGE_MODEL_NAME: ${IMAGE_MODEL_NAME:-google/vit-base-patch16-224}
       IMAGE_MODEL_REVISION: ${IMAGE_MODEL_REVISION:-main}
       DUPLICATE_SIMILARITY_THRESHOLD: ${DUPLICATE_SIMILARITY_THRESHOLD:-0.72}
+      DUPLICATE_SEARCH_RADIUS_KM: ${DUPLICATE_SEARCH_RADIUS_KM:-100}
     expose: ["8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
@@ -81,6 +82,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-nagrik}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nagrik_setu}?schema=public
       REDIS_URL: redis://redis:6379
       AI_SERVICE_URL: http://ai-service:8000
+      DUPLICATE_SEARCH_RADIUS_KM: ${DUPLICATE_SEARCH_RADIUS_KM:-100}
       STORAGE_ENDPOINT: http://minio:9000
       STORAGE_BUCKET: nagrik-private
       STORAGE_ACCESS_KEY: ${MINIO_APP_USER}
@@ -108,6 +110,13 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-nagrik}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nagrik_setu}?schema=public
       REDIS_URL: redis://redis:6379
       AI_SERVICE_URL: http://ai-service:8000
+      DUPLICATE_SEARCH_RADIUS_KM: ${DUPLICATE_SEARCH_RADIUS_KM:-100}
+      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_BUCKET: nagrik-private
+      STORAGE_ACCESS_KEY: ${MINIO_APP_USER}
+      STORAGE_SECRET_KEY: ${MINIO_APP_PASSWORD}
+      STORAGE_REGION: us-east-1
+      STORAGE_FORCE_PATH_STYLE: "true"
       NODE_ENV: production
     depends_on:
       postgres:
@@ -116,11 +125,27 @@ services:
         condition: service_healthy
       ai-service:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
 
   web:
     build: .
     ports:
       - "127.0.0.1:8080:80"
+    depends_on:
+      - api
+
+  frontend-next:
+    build:
+      context: .
+      dockerfile: frontend-next/Dockerfile
+      args:
+        BACKEND_URL: http://api:4000
+    environment:
+      BACKEND_URL: http://api:4000
+      PORT: 3000
+    ports:
+      - "127.0.0.1:3000:3000"
     depends_on:
       - api
 

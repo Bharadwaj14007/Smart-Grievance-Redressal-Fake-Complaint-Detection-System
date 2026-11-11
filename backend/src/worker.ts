@@ -5,13 +5,14 @@ import { z } from 'zod'
 import { env } from './config/env.js'
 import { prisma } from './config/prisma.js'
 import { getPrivateImage } from './services/storage.service.js'
+import { createNotification, deliverPendingNotifications } from './services/notification-delivery.service.js'
 
 const analysisResponse = z.object({
-  status: z.enum(['COMPLETED', 'NOT_CONFIGURED']),
-  result: z.record(z.unknown()).nullable(),
+  status: z.literal('COMPLETED'),
+  result: z.record(z.string(), z.unknown()).nullable(),
 })
 
-async function analyzeComplaint(job: Job<{ complaintId: string }>) {
+async function analyzeComplaint(job: Job<{ complaintId: string; analysisId?: string }>) {
   if (!env.AI_SERVICE_URL) throw new Error('AI service is not configured.')
   const complaint = await prisma.complaint.findUnique({
     where: { id: job.data.complaintId },
@@ -29,28 +30,44 @@ async function analyzeComplaint(job: Job<{ complaintId: string }>) {
     },
   })
   if (!complaint) throw new Error('Complaint no longer exists.')
-  await prisma.aIAnalysis.updateMany({ where: { complaintId: complaint.id, status: 'QUEUED' }, data: { status: 'PROCESSING', error: null } })
+  const analysisId = job.data.analysisId ?? (await prisma.aIAnalysis.findFirst({
+    where: { complaintId: complaint.id, status: 'QUEUED' },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true },
+  }))?.id
+  if (!analysisId) throw new Error('AI analysis record no longer exists.')
+  const started = await prisma.aIAnalysis.updateMany({
+    where: { id: analysisId, complaintId: complaint.id, status: { in: ['QUEUED', 'PROCESSING'] } },
+    data: { status: 'PROCESSING', error: null },
+  })
+  if (!started.count) return
 
-  const [categories, candidateRows, images] = await Promise.all([
+  const [categories, spatialCandidateIds, images] = await Promise.all([
     prisma.complaintCategory.findMany({
       where: { active: true },
       select: { id: true, name: true, department: { select: { id: true, name: true } } },
     }),
-    prisma.complaint.findMany({
-      where: { id: { not: complaint.id }, createdAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-      select: {
-        id: true,
-        trackingId: true,
-        title: true,
-        description: true,
-        categoryId: true,
-        createdAt: true,
-        location: { select: { state: true, district: true, city: true, latitude: true, longitude: true } },
-        aiAnalyses: { where: { status: 'COMPLETED' }, orderBy: { createdAt: 'desc' }, take: 1, select: { result: true } },
-      },
-    }),
+    prisma.$queryRaw<{ id: string }[]>`
+      SELECT candidate.id
+      FROM complaints candidate
+      JOIN complaint_locations candidate_location ON candidate_location.complaint_id = candidate.id
+      JOIN complaint_locations source_location ON source_location.complaint_id = ${complaint.id}::uuid
+      JOIN complaints source ON source.id = source_location.complaint_id
+      WHERE candidate.id <> ${complaint.id}::uuid
+        AND COALESCE(candidate.incident_at, candidate.created_at) BETWEEN
+          COALESCE(source.incident_at, source.created_at) - INTERVAL '30 days'
+          AND COALESCE(source.incident_at, source.created_at) + INTERVAL '30 days'
+        AND ST_DWithin(
+          candidate_location.location_geom::geography,
+          source_location.location_geom::geography,
+          ${env.DUPLICATE_SEARCH_RADIUS_KM * 1000}
+        )
+      ORDER BY ST_Distance(
+        candidate_location.location_geom::geography,
+        source_location.location_geom::geography
+      ), candidate.created_at DESC
+      LIMIT 100
+    `,
     Promise.all(complaint.images.map(async (image) => {
       const object = await getPrivateImage(image.objectKey)
       const bytes = await object.Body?.transformToByteArray()
@@ -58,6 +75,24 @@ async function analyzeComplaint(job: Job<{ complaintId: string }>) {
       return { id: image.id, contentType: image.contentType, data: Buffer.from(bytes).toString('base64') }
     })),
   ])
+  const candidateRows = spatialCandidateIds.length
+    ? await prisma.complaint.findMany({
+      where: { id: { in: spatialCandidateIds.map(({ id }) => id) } },
+      select: {
+        id: true,
+        trackingId: true,
+        title: true,
+        description: true,
+        categoryId: true,
+        createdAt: true,
+        incidentAt: true,
+        location: { select: { state: true, district: true, city: true, latitude: true, longitude: true } },
+        aiAnalyses: { where: { status: 'COMPLETED' }, orderBy: { createdAt: 'desc' }, take: 1, select: { result: true } },
+      },
+    })
+    : []
+  const candidateOrder = new Map(spatialCandidateIds.map(({ id }, index) => [id, index]))
+  candidateRows.sort((left, right) => (candidateOrder.get(left.id) ?? 0) - (candidateOrder.get(right.id) ?? 0))
   const candidates = candidateRows.map((candidate) => {
     const storedResult = candidate.aiAnalyses[0]?.result
     const result = storedResult && typeof storedResult === 'object' && !Array.isArray(storedResult) ? storedResult : {}
@@ -81,6 +116,7 @@ async function analyzeComplaint(job: Job<{ complaintId: string }>) {
       description: candidate.description,
       categoryId: candidate.categoryId,
       createdAt: candidate.createdAt.toISOString(),
+      incidentAt: candidate.incidentAt?.toISOString() ?? null,
       location: candidate.location,
       textEmbedding,
       imageEmbeddings,
@@ -108,7 +144,7 @@ async function analyzeComplaint(job: Job<{ complaintId: string }>) {
   if (!response.ok) throw new Error(`AI service returned HTTP ${response.status}.`)
   const output = analysisResponse.parse(await response.json())
   await prisma.aIAnalysis.updateMany({
-    where: { complaintId: complaint.id, status: 'PROCESSING' },
+    where: { id: analysisId, status: 'PROCESSING' },
     data: {
       status: output.status,
       result: output.result === null ? undefined : JSON.parse(JSON.stringify(output.result)) as Prisma.InputJsonValue,
@@ -121,6 +157,8 @@ if (!env.REDIS_URL) throw new Error('REDIS_URL is required to start the AI worke
 const connection = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null })
 const worker = new Worker('complaint-ai-analysis', analyzeComplaint, { connection, concurrency: 1 })
 const slaQueue = new Queue('complaint-sla-check', { connection })
+const notificationQueue = new Queue('notification-delivery', { connection })
+const notificationWorker = new Worker('notification-delivery', deliverPendingNotifications, { connection, concurrency: 1 })
 const slaWorker = new Worker('complaint-sla-check', async () => {
   const [complaints, configurations] = await Promise.all([
     prisma.complaint.findMany({
@@ -153,13 +191,11 @@ const slaWorker = new Worker('complaint-sla-check', async () => {
           note: `Automatically escalated because the ${responsePending ? 'response' : 'resolution'} SLA elapsed.`,
         },
       })
-      await tx.notification.create({
-        data: {
-          userId: complaint.citizenId,
-          complaintId: complaint.id,
-          type: 'SLA_ESCALATED',
-          message: `Complaint ${complaint.trackingId} was escalated after its ${responsePending ? 'response' : 'resolution'} target elapsed.`,
-        },
+      await createNotification(tx, {
+        userId: complaint.citizenId,
+        complaintId: complaint.id,
+        type: 'SLA_ESCALATED',
+        message: `Complaint ${complaint.trackingId} was escalated after its ${responsePending ? 'response' : 'resolution'} target elapsed.`,
       })
       await tx.auditLog.create({
         data: { action: 'SLA_ESCALATION', entityType: 'Complaint', entityId: complaint.id, metadata: { targetHours, responsePending } },
@@ -169,18 +205,30 @@ const slaWorker = new Worker('complaint-sla-check', async () => {
 }, { connection, concurrency: 1 })
 
 await slaQueue.add('periodic-check', {}, { repeat: { every: 15 * 60 * 1000 }, jobId: 'sla-periodic-check' })
+await notificationQueue.add('periodic-delivery', {}, { repeat: { every: 15_000 }, jobId: 'notification-periodic-delivery' })
 
 worker.on('failed', (job, error) => {
   console.error('Complaint AI job failed.', { jobId: job?.id, error })
   if (job && job.attemptsMade >= Number(job.opts.attempts ?? 1)) {
-    void prisma.aIAnalysis.updateMany({
-      where: { complaintId: job.data.complaintId, status: { in: ['QUEUED', 'PROCESSING'] } },
-      data: { status: 'FAILED', error: 'AI analysis could not be completed.' },
-    }).catch((updateError: unknown) => console.error('Could not persist AI failure state.', updateError))
+    void (async () => {
+      const analysisId = job.data.analysisId ?? (await prisma.aIAnalysis.findFirst({
+        where: { complaintId: job.data.complaintId, status: { in: ['QUEUED', 'PROCESSING'] } },
+        orderBy: { updatedAt: 'desc' },
+        select: { id: true },
+      }))?.id
+      if (!analysisId) throw new Error('No active analysis record was found for the failed AI job.')
+      await prisma.aIAnalysis.updateMany({
+        where: { id: analysisId, status: { in: ['QUEUED', 'PROCESSING'] } },
+        data: { status: 'FAILED', error: 'AI analysis could not be completed.' },
+      })
+    })().catch((updateError: unknown) => console.error('Could not persist AI failure state.', updateError))
   }
 })
 slaWorker.on('failed', (job, error) => {
   console.error('SLA check failed.', { jobId: job?.id, error })
+})
+notificationWorker.on('failed', (job, error) => {
+  console.error('Notification delivery batch failed.', { jobId: job?.id, error })
 })
 
 let closing = false
@@ -190,6 +238,8 @@ async function shutdown(signal: string) {
   console.info(`AI worker received ${signal}; shutting down.`)
   await slaWorker.close()
   await slaQueue.close()
+  await notificationWorker.close()
+  await notificationQueue.close()
   await worker.close()
   await connection.quit()
   await prisma.$disconnect()

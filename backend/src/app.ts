@@ -35,7 +35,7 @@ app.get('/readyz', async (_req, res) => {
 
 const openApiSpec = {
   openapi: '3.0.3',
-  info: { title: 'Nagrik Setu API', version: '1.0.0', description: 'Grievance portal API. All routes except authentication and health require an access cookie.' },
+  info: { title: 'Nagrik Setu API', version: '1.0.0', description: 'Grievance portal API. Protected routes require an access cookie; authentication, metadata and health routes are public.' },
   servers: [{ url: '/api/v1' }],
   components: {
     securitySchemes: { accessCookie: { type: 'apiKey', in: 'cookie', name: 'access_token' } },
@@ -55,8 +55,17 @@ const openApiSpec = {
       post: { security: [{ accessCookie: [] }], summary: 'Create a complaint', responses: { '201': { description: 'Complaint created' }, '400': { description: 'Invalid input' } } },
     },
     '/complaints/{id}': { get: { security: [{ accessCookie: [] }], summary: 'Get complaint details', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }], responses: { '200': { description: 'Complaint details' }, '404': { description: 'Not found' } } } },
+    '/complaints/{id}/ai-analysis': { get: { security: [{ accessCookie: [] }], summary: 'Get role-scoped AI analysis history for a complaint', responses: { '200': { description: 'Analysis history and role-appropriate result details' }, '403': { description: 'Complaint access denied' } } } },
     '/notifications': { get: { security: [{ accessCookie: [] }], summary: 'List current user notifications', responses: { '200': { description: 'Notifications' } } } },
+    '/notifications/{id}/read': { patch: { security: [{ accessCookie: [] }], summary: 'Mark a notification as read', responses: { '200': { description: 'Notification marked as read' }, '404': { description: 'Notification not found' } } } },
+    '/notifications/read-all': { patch: { security: [{ accessCookie: [] }], summary: 'Mark all current user notifications as read', responses: { '200': { description: 'Unread notifications marked as read' } } } },
     '/admin/dashboard': { get: { security: [{ accessCookie: [] }], summary: 'Get administration dashboard metrics', responses: { '200': { description: 'Dashboard metrics' }, '403': { description: 'Administrator role required' } } } },
+    '/admin/ai/monitoring': { get: { security: [{ accessCookie: [] }], summary: 'Review AI analysis counts, model availability and recent results', responses: { '200': { description: 'AI monitoring data' }, '403': { description: 'Administrator role required' } } } },
+    '/admin/notification-deliveries': { get: { security: [{ accessCookie: [] }], summary: 'List email and SMS delivery attempts', responses: { '200': { description: 'Delivery status and provider errors' }, '403': { description: 'Administrator role required' } } } },
+    '/admin/complaints/{id}/duplicates': { get: { security: [{ accessCookie: [] }], summary: 'List AI-derived duplicate candidates and persisted review history', responses: { '200': { description: 'Duplicate candidates and prior decisions' }, '403': { description: 'Administrator role required' } } } },
+    '/admin/complaints/{id}/duplicate-reviews': { post: { security: [{ accessCookie: [] }], summary: 'Persist a duplicate-review decision', responses: { '201': { description: 'Review decision recorded' }, '403': { description: 'Administrator role required' } } } },
+    '/admin/sla': { get: { security: [{ accessCookie: [] }], summary: 'List SLA configurations', responses: { '200': { description: 'SLA configurations' } } }, post: { security: [{ accessCookie: [] }], summary: 'Create an SLA configuration', responses: { '201': { description: 'SLA created' } } } },
+    '/admin/sla/{id}': { put: { security: [{ accessCookie: [] }], summary: 'Create or update an SLA configuration by its database UUID', responses: { '200': { description: 'SLA updated' } } } },
   },
 }
 const disableDocsCsp: RequestHandler = (_req, res, next) => {

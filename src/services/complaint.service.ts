@@ -1,5 +1,6 @@
 import { apiClient } from './api'
 import { mapComplaint, toApiStatus, type ApiComplaint, type ApiEnvelope } from './api.models'
+import type { AIAnalysisHistory, AIDuplicateReviewData } from './ai.models'
 import { invalidatePortalData, queryClient } from './queryClient'
 import { isDemoMode, useAppStore, type Complaint, type ComplaintStatus } from '../store/useAppStore'
 
@@ -26,16 +27,6 @@ export class ComplaintImageUploadError extends Error {
     super('The complaint was created, but one or more images could not be uploaded.')
     this.name = 'ComplaintImageUploadError'
   }
-}
-
-export type DuplicateReviewRecord = {
-  id: string
-  decision: string
-  notes?: string | null
-  createdAt: string
-  complaint: { trackingId: string }
-  candidate: { trackingId: string }
-  reviewer: { email: string }
 }
 
 async function findComplaint(id: string) {
@@ -171,15 +162,23 @@ export const complaintService = {
       notes,
     })
     await invalidatePortalData()
+    await queryClient.invalidateQueries({ queryKey: ['duplicate-review', id] })
   },
-  getDuplicateReviews: async (id: string): Promise<DuplicateReviewRecord[]> => {
-    if (isDemoMode) return []
+  getDuplicateReviews: async (id: string): Promise<AIDuplicateReviewData> => {
+    if (isDemoMode) return { complaintId: id, analysisStatus: 'NOT_CONFIGURED', candidates: [], reviews: [] }
     const complaint = await findComplaint(id)
     if (!complaint?.recordId) throw new Error('Complaint not found. Refresh the list and try again.')
-    const response = await apiClient.get<ApiEnvelope<{ reviews: DuplicateReviewRecord[] }>>(
+    const response = await apiClient.get<ApiEnvelope<AIDuplicateReviewData>>(
       `/admin/complaints/${complaint.recordId}/duplicates`,
     )
-    return response.data.data.reviews
+    return response.data.data
+  },
+  getAIAnalysis: async (id: string): Promise<AIAnalysisHistory> => {
+    if (isDemoMode) return { latest: { id: '', status: 'NOT_CONFIGURED', createdAt: '', updatedAt: '' }, history: [] }
+    const complaint = await findComplaint(id)
+    if (!complaint?.recordId) throw new Error('Complaint not found. Refresh the list and try again.')
+    const response = await apiClient.get<ApiEnvelope<AIAnalysisHistory>>(`/complaints/${complaint.recordId}/ai-analysis`)
+    return response.data.data
   },
   getComplaintTimeline: (id: string) => {
     const complaint = useAppStore.getState().complaints.find((item) => item.id === id)

@@ -1,6 +1,6 @@
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { ComplaintStatus, Role } from '@prisma/client'
+import { ComplaintStatus, Prisma, Role } from '@prisma/client'
 import { Router } from 'express'
 import multer from 'multer'
 import { prisma } from '../config/prisma.js'
@@ -10,6 +10,7 @@ import { complaintQuerySchema, createComplaintSchema, statusSchema } from '../va
 import { addInvestigationNote, assignComplaint, createComplaint, getComplaintForUser, listComplaints, updateStatus } from '../services/complaint.service.js'
 import { getPrivateImage, storePrivateImage } from '../services/storage.service.js'
 import { writeAudit } from '../services/audit.service.js'
+import { queueComplaintReanalysis } from '../services/ai-analysis.service.js'
 
 export const complaintRouter = Router()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 512 * 1024, files: 4 } })
@@ -64,6 +65,7 @@ complaintRouter.post('/:id/images', upload.array('images', 4), asyncHandler(asyn
       data: { complaintId: complaint.id, objectKey: object.key, contentType: object.contentType, sizeBytes: object.sizeBytes },
     }))
   }
+  if (stored.length) await queueComplaintReanalysis(complaint.id)
   await writeAudit(req, 'COMPLAINT_IMAGES_UPLOADED', 'Complaint', complaint.id, { count: stored.length })
   res.status(201).json({ success: true, message: 'Complaint images uploaded.', data: stored })
 }))
@@ -117,6 +119,59 @@ complaintRouter.post('/:id/feedback', requireRoles(Role.CITIZEN), asyncHandler(a
 
 complaintRouter.get('/:id/ai-analysis', asyncHandler(async (req, res) => {
   const complaint = await getComplaintForUser(req, req.params.id)
-  const analysis = await prisma.aIAnalysis.findFirst({ where: { complaintId: complaint.id }, orderBy: { createdAt: 'desc' } })
-  res.json({ success: true, data: analysis ?? { status: 'NOT_CONFIGURED', result: null } })
+  const analyses = await prisma.aIAnalysis.findMany({
+    where: { complaintId: complaint.id },
+    orderBy: { createdAt: 'desc' },
+  })
+  const history = req.user?.role === Role.ADMIN
+    ? analyses
+    : analyses.map((analysis) => {
+      const result = analysis.result && typeof analysis.result === 'object' && !Array.isArray(analysis.result)
+        ? analysis.result as Prisma.JsonObject
+        : {}
+      const officerImages = Array.isArray(result.images)
+        ? result.images.flatMap((image) => {
+          if (!image || typeof image !== 'object' || Array.isArray(image)) return []
+          const record = image as Prisma.JsonObject
+          return [{
+            id: record.id,
+            width: record.width,
+            height: record.height,
+            format: record.format,
+            capturedAt: record.capturedAt,
+            classification: record.classification,
+            forensicIndicators: record.forensicIndicators,
+            elaMeanDifference: record.elaMeanDifference,
+            opencv: record.opencv,
+          }]
+        })
+        : []
+      return {
+      id: analysis.id,
+      status: analysis.status,
+      createdAt: analysis.createdAt,
+      updatedAt: analysis.updatedAt,
+      ...(req.user?.role === Role.OFFICER
+        ? {
+          result: {
+            model: result.model,
+            processedAt: result.processedAt,
+            processingSeconds: result.processingSeconds,
+            predictedCategory: result.predictedCategory,
+            recommendedDepartment: result.recommendedDepartment,
+            recommendedPriority: result.recommendedPriority,
+            images: officerImages,
+            humanReviewRequired: result.humanReviewRequired,
+          },
+        }
+        : {}),
+      }
+    })
+  res.json({
+    success: true,
+    data: {
+      latest: history[0] ?? { status: 'NOT_CONFIGURED', result: null },
+      history,
+    },
+  })
 }))

@@ -2,7 +2,8 @@ import { ComplaintStatus, Prisma, Priority, Role } from '@prisma/client'
 import type { Request } from 'express'
 import { prisma } from '../config/prisma.js'
 import { env } from '../config/env.js'
-import { getAIQueue } from './queue.service.js'
+import { enqueueAIAnalysis } from './ai-analysis.service.js'
+import { createNotification } from './notification-delivery.service.js'
 import { writeAudit } from './audit.service.js'
 import { HttpError } from '../utils/errors.js'
 
@@ -54,9 +55,14 @@ export async function createComplaint(req: Request, input: {
         location: { create: input.location },
         history: { create: { toStatus: ComplaintStatus.SUBMITTED, actorId: req.user!.id, note: 'Complaint submitted.' } },
         aiAnalyses: { create: { status: env.REDIS_URL && env.AI_SERVICE_URL ? 'QUEUED' : 'NOT_CONFIGURED' } },
-        notifications: { create: { userId: req.user!.id, type: 'COMPLAINT_SUBMITTED', message: `Complaint ${trackingId} was submitted.` } },
       },
       include: { category: true, location: true, history: true, aiAnalyses: true },
+    })
+    await createNotification(tx, {
+      userId: req.user!.id,
+      complaintId: created.id,
+      type: 'COMPLAINT_SUBMITTED',
+      message: `Complaint ${trackingId} was submitted.`,
     })
     await tx.auditLog.create({
       data: { actorId: req.user!.id, action: 'COMPLAINT_SUBMITTED', entityType: 'Complaint', entityId: created.id, ipAddress: req.ip },
@@ -64,19 +70,8 @@ export async function createComplaint(req: Request, input: {
     return created
   })
 
-  if (env.REDIS_URL && env.AI_SERVICE_URL) {
-    try {
-      await getAIQueue()?.add('analyze-complaint', { complaintId: complaint.id }, {
-        attempts: 4,
-        backoff: { type: 'exponential', delay: 1500 },
-        removeOnComplete: 1000,
-        removeOnFail: 3000,
-      })
-    } catch (error) {
-      console.error(`Failed to enqueue AI analysis for ${complaint.trackingId}`, error)
-      await prisma.aIAnalysis.updateMany({ where: { complaintId: complaint.id }, data: { status: 'FAILED', error: 'AI job queue unavailable.' } })
-    }
-  }
+  const analysis = complaint.aiAnalyses[0]
+  if (analysis) await enqueueAIAnalysis(complaint.id, analysis.id)
   return complaint
 }
 
@@ -133,7 +128,7 @@ export async function getComplaintForUser(req: Request, id: string) {
       history: { orderBy: { createdAt: 'asc' } },
       notes: { where: req.user.role !== Role.CITIZEN ? {} : { isPublic: true }, orderBy: { createdAt: 'asc' }, include: { author: { select: { email: true, role: true } } } },
       assignments: { where: { active: true }, include: { officer: { select: { id: true, email: true, officerProfile: true } } } },
-      aiAnalyses: { orderBy: { createdAt: 'desc' }, take: 1 },
+      aiAnalyses: { orderBy: { createdAt: 'desc' }, take: 1, select: { id: true, status: true, createdAt: true, updatedAt: true } },
       feedback: true,
     },
   })
@@ -158,14 +153,20 @@ export async function updateStatus(req: Request, id: string, nextStatus: Complai
     if (!changed.count) throw new HttpError(409, 'Complaint status changed; reload and try again.')
     const complaint = await tx.complaint.findUniqueOrThrow({ where: { id } })
     await tx.complaintStatusHistory.create({ data: { complaintId: id, fromStatus: current.status, toStatus: nextStatus, note, actorId: req.user!.id } })
-    await tx.notification.create({
-      data: {
+    await createNotification(tx, {
+      userId: current.citizenId,
+      complaintId: id,
+      type: nextStatus === 'RESOLVED' ? 'COMPLAINT_RESOLVED' : nextStatus === 'ESCALATED' ? 'COMPLAINT_ESCALATED' : 'STATUS_CHANGED',
+      message: `Complaint ${current.trackingId} status changed to ${nextStatus}.`,
+    })
+    if (nextStatus === 'RESOLVED' && !(await tx.notification.findFirst({ where: { complaintId: id, userId: current.citizenId, type: 'FEEDBACK_REQUEST' }, select: { id: true } }))) {
+      await createNotification(tx, {
         userId: current.citizenId,
         complaintId: id,
-        type: nextStatus === 'RESOLVED' ? 'COMPLAINT_RESOLVED' : nextStatus === 'ESCALATED' ? 'COMPLAINT_ESCALATED' : 'STATUS_CHANGED',
-        message: `Complaint ${current.trackingId} status changed to ${nextStatus}.`,
-      },
-    })
+        type: 'FEEDBACK_REQUEST',
+        message: `Please share feedback on the resolution of complaint ${current.trackingId}.`,
+      })
+    }
     await tx.auditLog.create({ data: { actorId: req.user!.id, action: 'COMPLAINT_STATUS_CHANGED', entityType: 'Complaint', entityId: id, metadata: { from: current.status, to: nextStatus }, ipAddress: req.ip } })
     return complaint
   })
@@ -178,7 +179,7 @@ export async function addInvestigationNote(req: Request, id: string, body: strin
   const note = await prisma.$transaction(async (tx) => {
     const created = await tx.investigationNote.create({ data: { complaintId: id, authorId: req.user!.id, body, isPublic } })
     await tx.auditLog.create({ data: { actorId: req.user!.id, action: 'INVESTIGATION_NOTE_ADDED', entityType: 'Complaint', entityId: id, ipAddress: req.ip } })
-    if (isPublic) await tx.notification.create({ data: { userId: complaint.citizenId, complaintId: id, type: 'OFFICER_REMARK', message: `A new update was added to ${complaint.trackingId}.` } })
+    if (isPublic) await createNotification(tx, { userId: complaint.citizenId, complaintId: id, type: 'OFFICER_REMARK', message: `A new update was added to ${complaint.trackingId}.` })
     return created
   })
   return note
@@ -204,7 +205,8 @@ export async function assignComplaint(req: Request, id: string, officerId: strin
     await tx.complaintAssignment.create({ data: { complaintId: id, officerId, departmentId: department, assignedById: req.user!.id } })
     const updated = await tx.complaint.update({ where: { id }, data: { departmentId: department, status: 'ASSIGNED' } })
     await tx.complaintStatusHistory.create({ data: { complaintId: id, fromStatus: current.status, toStatus: 'ASSIGNED', actorId: req.user!.id, note: 'Complaint assigned to an officer.' } })
-    await tx.notification.create({ data: { userId: current.citizenId, complaintId: id, type: 'COMPLAINT_ASSIGNED', message: `Complaint ${current.trackingId} was assigned for investigation.` } })
+    await createNotification(tx, { userId: current.citizenId, complaintId: id, type: 'COMPLAINT_ASSIGNED', message: `Complaint ${current.trackingId} was assigned for investigation.` })
+    await createNotification(tx, { userId: officerId, complaintId: id, type: 'COMPLAINT_ASSIGNED_TO_OFFICER', message: `Complaint ${current.trackingId} was assigned to you for investigation.` })
     await tx.auditLog.create({ data: { actorId: req.user!.id, action: 'COMPLAINT_ASSIGNED', entityType: 'Complaint', entityId: id, metadata: { officerId, departmentId: department }, ipAddress: req.ip } })
     return updated
   })

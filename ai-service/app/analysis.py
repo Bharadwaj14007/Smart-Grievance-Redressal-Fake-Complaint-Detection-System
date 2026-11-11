@@ -2,6 +2,7 @@ import base64
 import io
 import math
 import os
+import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Optional
@@ -10,10 +11,13 @@ from typing import Any, Optional
 TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 IMAGE_MODEL_NAME = os.getenv("IMAGE_MODEL_NAME", "google/vit-base-patch16-224")
 DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_SIMILARITY_THRESHOLD", "0.72"))
+DUPLICATE_SEARCH_RADIUS_KM = float(os.getenv("DUPLICATE_SEARCH_RADIUS_KM", "100"))
 TEXT_MODEL_REVISION = os.getenv("TEXT_MODEL_REVISION", "main")
 IMAGE_MODEL_REVISION = os.getenv("IMAGE_MODEL_REVISION", "main")
 if not 0 <= DUPLICATE_THRESHOLD <= 1:
     raise ValueError("DUPLICATE_SIMILARITY_THRESHOLD must be between 0 and 1.")
+if DUPLICATE_SEARCH_RADIUS_KM <= 0:
+    raise ValueError("DUPLICATE_SEARCH_RADIUS_KM must be greater than zero.")
 
 
 @lru_cache(maxsize=1)
@@ -32,6 +36,23 @@ def _image_models():
     model = AutoModelForImageClassification.from_pretrained(IMAGE_MODEL_NAME, revision=IMAGE_MODEL_REVISION)
     model.eval()
     return torch, processor, model
+
+
+def model_status() -> dict[str, dict[str, Any]]:
+    return {
+        "text": {
+            "name": TEXT_MODEL_NAME,
+            "revision": TEXT_MODEL_REVISION,
+            "configured": True,
+            "loaded": _text_model.cache_info().currsize > 0,
+        },
+        "image": {
+            "name": IMAGE_MODEL_NAME,
+            "revision": IMAGE_MODEL_REVISION,
+            "configured": True,
+            "loaded": _image_models.cache_info().currsize > 0,
+        },
+    }
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -82,7 +103,9 @@ def _decode_image(encoded: str):
 
 
 def _analyze_image(encoded: str, expected_content_type: str, incident_at: Optional[str]) -> dict[str, Any]:
+    import cv2
     import imagehash
+    import numpy as np
     import torch
     from PIL import ExifTags, Image, ImageChops, ImageStat
 
@@ -90,6 +113,12 @@ def _analyze_image(encoded: str, expected_content_type: str, incident_at: Option
     detected_content_type = f"image/{'jpeg' if source_image.format == 'JPEG' else source_image.format.lower()}"
     if expected_content_type != detected_content_type:
         raise ValueError("Image content does not match its stored content type.")
+    decoded = cv2.imdecode(np.frombuffer(original_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if decoded is None or decoded.shape[1] != source_image.width or decoded.shape[0] != source_image.height:
+        raise ValueError("Image dimensions could not be verified by both decoders.")
+    gray = cv2.cvtColor(decoded, cv2.COLOR_BGR2GRAY)
+    blur_variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    mean_luminance = float(gray.mean())
     torch_module, processor, model = _image_models()
     inputs = processor(images=rgb_image, return_tensors="pt")
     with torch_module.inference_mode():
@@ -109,7 +138,7 @@ def _analyze_image(encoded: str, expected_content_type: str, incident_at: Option
         try:
             captured_time = datetime.strptime(str(captured_at), "%Y:%m:%d %H:%M:%S").replace(tzinfo=timezone.utc)
             incident_time = _as_datetime(incident_at)
-            if captured_time > incident_time:
+            if captured_time.date() > incident_time.date():
                 indicators.append("The embedded capture time is later than the reported incident time; metadata may be inaccurate.")
         except ValueError:
             indicators.append("The embedded capture time could not be parsed.")
@@ -139,8 +168,37 @@ def _analyze_image(encoded: str, expected_content_type: str, incident_at: Option
         "forensicIndicators": indicators,
         "elaMeanDifference": float(ela_mean_difference),
         "sizeBytes": len(original_bytes),
+        "opencv": {
+            "width": int(decoded.shape[1]),
+            "height": int(decoded.shape[0]),
+            "laplacianVariance": blur_variance,
+            "meanLuminance": mean_luminance,
+        },
     }
+
+
+def _recommend_priority(title: str, description: str, submitted: str) -> dict[str, Any]:
+    text = f"{title} {description}".casefold()
+    critical_terms = ("fire", "collapse", "electrocution", "gas leak", "life threatening", "person trapped", "open manhole")
+    matched_terms = [term for term in critical_terms if term in text]
+    normalized_submitted = submitted.upper()
+    submitted_priority = normalized_submitted if normalized_submitted in {"LOW", "MEDIUM", "HIGH", "CRITICAL"} else "MEDIUM"
+    value = "CRITICAL" if matched_terms else submitted_priority
+    reasons = (
+        [f"Urgent safety term matched: {term}." for term in matched_terms]
+        if matched_terms
+        else [f"Retained the citizen-submitted severity ({submitted_priority}); no independent trained priority model is claimed."]
+    )
+    return {
+        "value": value,
+        "method": "safety_rules_v1",
+        "reasons": reasons,
+        "model": None,
+    }
+
+
 def analyze(payload: dict[str, Any]) -> dict[str, Any]:
+    started_at = time.monotonic()
     text_model = _text_model()
     complaint_text = f"{payload['title']}. {payload['description']}"
     text_embedding = text_model.encode(complaint_text, normalize_embeddings=True).tolist()
@@ -203,8 +261,8 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
             and candidate.get("categoryId") == predicted_category["categoryId"]
         )
         distance = geographic_distance_km(payload.get("location"), candidate.get("location"))
-        candidate_time = _as_datetime(candidate["createdAt"])
-        complaint_time = _as_datetime(payload["createdAt"])
+        candidate_time = _as_datetime(candidate.get("incidentAt") or candidate["createdAt"])
+        complaint_time = _as_datetime(payload.get("incidentAt") or payload["createdAt"])
         time_gap_hours = abs((complaint_time - candidate_time).total_seconds()) / 3600
         phash_similarities = []
         for current_hash in perceptual_hashes:
@@ -220,49 +278,61 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
             for current in image_embeddings
             for previous in candidate.get("imageEmbeddings", [])
         ]
-        signals = [
-            {"name": "text_semantic_similarity", "value": semantic_similarity},
-            {"name": "category_match", "value": 1.0 if same_category else 0.0},
-            {"name": "time_gap_hours", "value": time_gap_hours},
+        score_parts = [
+            {"name": "text_semantic_similarity", "value": max(0.0, semantic_similarity), "observed": semantic_similarity, "weight": 0.55},
+            {"name": "category_match", "value": 1.0 if same_category else 0.0, "observed": 1.0 if same_category else 0.0, "weight": 0.15},
+            {"name": "incident_date_proximity", "value": max(0.0, 1 - time_gap_hours / (24 * 30)), "observed": time_gap_hours, "weight": 0.1},
         ]
-        score_parts = [(max(0.0, semantic_similarity), 0.65), (1.0 if same_category else 0.0, 0.15)]
         if distance is not None:
-            signals.append({"name": "geographic_distance_km", "value": distance})
-            score_parts.append((max(0.0, 1 - distance / 100), 0.1))
-        score_parts.append((max(0.0, 1 - time_gap_hours / (24 * 30)), 0.1))
+            score_parts.append({"name": "geographic_proximity", "value": max(0.0, 1 - distance / DUPLICATE_SEARCH_RADIUS_KM), "observed": distance, "weight": 0.1})
         if phash_similarities:
-            signals.append({"name": "perceptual_hash_similarity", "value": max(phash_similarities)})
-            score_parts.append((max(phash_similarities), 0.15))
+            score_parts.append({"name": "perceptual_hash_similarity", "value": max(phash_similarities), "observed": max(phash_similarities), "weight": 0.15})
         if image_embedding_similarities:
-            signals.append({"name": "image_embedding_similarity", "value": max(image_embedding_similarities)})
-            score_parts.append((max(0.0, max(image_embedding_similarities)), 0.15))
-        total_weight = sum(weight for _, weight in score_parts)
-        duplicate_score = sum(value * weight for value, weight in score_parts) / total_weight
+            image_similarity = max(image_embedding_similarities)
+            score_parts.append({"name": "image_embedding_similarity", "value": max(0.0, image_similarity), "observed": image_similarity, "weight": 0.15})
+        total_weight = sum(part["weight"] for part in score_parts)
+        duplicate_score = sum(part["value"] * part["weight"] for part in score_parts) / total_weight
         if duplicate_score >= DUPLICATE_THRESHOLD:
             duplicates.append({
                 "complaintId": candidate["id"],
                 "trackingId": candidate["trackingId"],
                 "similarity": duplicate_score,
-                "signals": signals,
+                "signals": [
+                    {
+                        "name": part["name"],
+                        "value": part["observed"],
+                        "normalizedValue": part["value"],
+                        "weight": part["weight"] / total_weight,
+                        "contribution": part["value"] * part["weight"] / total_weight,
+                    }
+                    for part in score_parts
+                ],
+                "method": "weighted_signals_v1",
             })
 
-    severity = str(payload.get("severity", "MEDIUM")).upper()
-    priority = severity if severity in {"LOW", "MEDIUM", "HIGH", "CRITICAL"} else "MEDIUM"
     return {
         "model": {
-            "text": {"name": TEXT_MODEL_NAME, "revision": TEXT_MODEL_REVISION},
-            "image": {"name": IMAGE_MODEL_NAME, "revision": IMAGE_MODEL_REVISION},
+            "text": {"name": TEXT_MODEL_NAME, "revision": TEXT_MODEL_REVISION, "task": "semantic_embedding"},
+            "image": {"name": IMAGE_MODEL_NAME, "revision": IMAGE_MODEL_REVISION, "task": "general_image_classification"},
         },
+        "processedAt": datetime.now(timezone.utc).isoformat(),
+        "processingSeconds": round(time.monotonic() - started_at, 3),
         "predictedCategory": predicted_category,
         "categoryCandidates": category_scores,
         "recommendedDepartment": predicted_category.get("department") if predicted_category else None,
-        "recommendedPriority": {
-            "value": priority,
-            "reason": f"Retained the citizen-submitted severity ({priority}); no separate priority model is claimed.",
+        "recommendedPriority": _recommend_priority(payload["title"], payload["description"], payload.get("severity", "MEDIUM")),
+        "duplicateDetection": {
+            "threshold": DUPLICATE_THRESHOLD,
+            "geographicSearchRadiusKm": DUPLICATE_SEARCH_RADIUS_KM,
+            "method": "weighted_signals_v1",
+            "notes": "Similarity is a heuristic ranking signal, not a calibrated probability or finding of duplication.",
         },
         "textEmbedding": text_embedding,
         "images": images,
         "duplicateCandidates": sorted(duplicates, key=lambda item: item["similarity"], reverse=True),
-        "humanReviewRequired": bool(duplicates or any(image["forensicIndicators"] for image in images)),
+        "humanReviewRequired": bool(duplicates or any(
+            any("later than the reported incident" in indicator for indicator in image["forensicIndicators"])
+            for image in images
+        )),
         "disclaimer": "Image labels and forensic indicators are supporting signals only and do not establish complaint authenticity or fraud.",
     }

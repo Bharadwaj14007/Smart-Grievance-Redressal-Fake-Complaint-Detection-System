@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from app.analysis import analyze, cosine_similarity, geographic_distance_km
+from app.analysis import _recommend_priority, analyze, cosine_similarity, geographic_distance_km
 
 
 class Vector(list):
@@ -69,6 +69,20 @@ class AnalysisHelpersTest(unittest.TestCase):
             ["complaint-0", "complaint-1"],
         )
         self.assertEqual(len([call for call in model.batch_calls if len(call) == 2]), 1)
+        candidate = result["duplicateCandidates"][0]
+        self.assertAlmostEqual(sum(signal["contribution"] for signal in candidate["signals"]), candidate["similarity"])
+        self.assertEqual(candidate["method"], "weighted_signals_v1")
+
+    def test_priority_safety_rule_is_explainable_without_ml_confidence(self):
+        recommendation = _recommend_priority(
+            "Gas leak near a school",
+            "Residents report a strong smell and immediate danger.",
+            "LOW",
+        )
+        self.assertEqual(recommendation["value"], "CRITICAL")
+        self.assertEqual(recommendation["method"], "safety_rules_v1")
+        self.assertTrue(recommendation["reasons"])
+        self.assertNotIn("confidence", recommendation)
 
 
 if __name__ == "__main__":
