@@ -104,7 +104,15 @@ export async function listComplaints(req: Request, query: {
       orderBy: { createdAt: 'desc' },
       skip: (query.page - 1) * query.pageSize,
       take: query.pageSize,
-      include: { category: true, department: true, location: true, assignments: { where: { active: true }, include: { officer: { select: { id: true, email: true, officerProfile: true } } } } },
+      include: {
+        category: true,
+        department: true,
+        location: true,
+        citizen: { select: { email: true, citizenProfile: { select: { fullName: true } } } },
+        resolutionEvidence: { select: { id: true } },
+        assignments: { where: { active: true }, include: { officer: { select: { id: true, email: true, officerProfile: true } } } },
+        aiAnalyses: { orderBy: { createdAt: 'desc' }, take: 1, select: { status: true } },
+      },
     }),
     prisma.complaint.count({ where }),
   ])
@@ -117,10 +125,12 @@ export async function getComplaintForUser(req: Request, id: string) {
     where: { id },
     include: {
       category: true, department: true, location: true, images: true, resolutionEvidence: true,
+      citizen: { select: { email: true, citizenProfile: { select: { fullName: true } } } },
       history: { orderBy: { createdAt: 'asc' } },
       notes: { where: req.user.role !== Role.CITIZEN ? {} : { isPublic: true }, orderBy: { createdAt: 'asc' }, include: { author: { select: { email: true, role: true } } } },
       assignments: { where: { active: true }, include: { officer: { select: { id: true, email: true, officerProfile: true } } } },
       aiAnalyses: { orderBy: { createdAt: 'desc' }, take: 1 },
+      feedback: true,
     },
   })
   if (!complaint) throw new HttpError(404, 'Complaint not found.')

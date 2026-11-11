@@ -1,7 +1,17 @@
-import { useAppStore } from '../store/useAppStore'
+import { apiClient } from './api'
+import { invalidatePortalData } from './queryClient'
+import { isDemoMode, useAppStore } from '../store/useAppStore'
 
 export const notificationService = {
   getNotifications: () => useAppStore.getState().notifications,
-  markAsRead: (id: string) => useAppStore.getState().markNotificationRead(id),
-  markAllAsRead: () => useAppStore.getState().markAllNotificationsRead(),
+  markAsRead: async (id: string) => {
+    if (isDemoMode) return useAppStore.getState().markNotificationRead(id)
+    await apiClient.patch(`/notifications/${id}/read`)
+    await invalidatePortalData()
+  },
+  markAllAsRead: async () => {
+    if (isDemoMode) return useAppStore.getState().markAllNotificationsRead()
+    await apiClient.patch('/notifications/read-all')
+    await invalidatePortalData()
+  },
 }

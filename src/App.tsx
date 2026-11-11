@@ -25,7 +25,8 @@ import {
   Users,
   X,
 } from 'lucide-react'
-import { Fragment, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
 import {
   Bar,
@@ -42,7 +43,7 @@ import {
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { z } from 'zod'
 import { toast } from 'sonner'
-import { useAppStore, type Complaint, type ComplaintStatus, type Role } from './store/useAppStore'
+import { isDemoMode, useAppStore, type Complaint, type ComplaintStatus, type Role } from './store/useAppStore'
 import { authService } from './services/auth.service'
 import { complaintService } from './services/complaint.service'
 import { departmentService } from './services/department.service'
@@ -51,6 +52,12 @@ import { officerService } from './services/officer.service'
 import { adminService } from './services/admin.service'
 import { ProtectedRoute } from './routes/ProtectedRoute'
 import { downloadCsv } from './utils/csv'
+import { fetchPortalData } from './services/portal-data.service'
+import { getApiErrorMessage } from './services/api'
+import { notificationService } from './services/notification.service'
+import { ComplaintImageUploadError, type ComplaintSubmission } from './services/complaint.service'
+import { mapStatus } from './services/api.models'
+import { queryClient } from './services/queryClient'
 import { LocationMap } from './components/maps/LocationMap'
 import { Pill, SectionHeader, StatCard, StatusBadge } from './components/common/PortalUI'
 
@@ -67,9 +74,6 @@ const navConfig = {
   officer: [
     { label: 'Overview', to: '/officer/overview', icon: LayoutDashboard },
     { label: 'Assigned Complaints', to: '/officer/assigned', icon: ClipboardCheck },
-    { label: 'Department Complaints', to: '/officer/department', icon: FileText },
-    { label: 'Duplicate Complaints', to: '/officer/duplicates', icon: AlertTriangle },
-    { label: 'Suspicious Submissions', to: '/officer/suspicious', icon: ShieldCheck },
     { label: 'Reports', to: '/officer/reports', icon: TrendingUp },
     { label: 'Profile', to: '/officer/profile', icon: User },
   ],
@@ -78,7 +82,6 @@ const navConfig = {
     { label: 'All Complaints', to: '/admin/complaints', icon: FileText },
     { label: 'AI Monitoring', to: '/admin/ai', icon: Sparkles },
     { label: 'Duplicate Detection', to: '/admin/duplicates', icon: AlertTriangle },
-    { label: 'Fraud Review Queue', to: '/admin/fraud', icon: Flag },
     { label: 'Citizens', to: '/admin/citizens', icon: Users },
     { label: 'Officers', to: '/admin/officers', icon: ShieldCheck },
     { label: 'Departments', to: '/admin/departments', icon: Building2 },
@@ -86,7 +89,6 @@ const navConfig = {
     { label: 'SLA Management', to: '/admin/sla', icon: Gauge },
     { label: 'Analytics & Reports', to: '/admin/reports', icon: TrendingUp },
     { label: 'Audit Logs', to: '/admin/audit-logs', icon: ClipboardCheck },
-    { label: 'Settings', to: '/admin/settings', icon: Gauge },
     { label: 'Profile', to: '/admin/profile', icon: User },
   ],
 } as const
@@ -98,11 +100,33 @@ const formatDate = (value: string) =>
     year: 'numeric',
   }).format(new Date(value))
 
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+function getAvailableStatuses(current: ComplaintStatus): ComplaintStatus[] {
+  const transitions: Record<ComplaintStatus, ComplaintStatus[]> = {
+    Pending: ['Under Review', 'Escalated'],
+    'AI Analysis': ['Under Review', 'Escalated'],
+    Assigned: ['Under Review', 'In Progress', 'Escalated'],
+    'Under Review': ['In Progress', 'Resolved', 'Escalated'],
+    'In Progress': ['Under Review', 'Resolved', 'Escalated'],
+    Resolved: ['Closed', 'In Progress'],
+    Closed: [],
+    Escalated: ['Under Review', 'In Progress', 'Resolved'],
+  }
+  return transitions[current]
+}
+
 const complaintSchema = z.object({
   title: z.string().min(10, 'Please provide a clear title.'),
   description: z.string().min(30, 'Please describe the issue in more detail.'),
   category: z.string().min(1, 'Choose a category.'),
-  subcategory: z.string().min(1, 'Choose a subcategory.'),
   severity: z.enum(['Low', 'Medium', 'High', 'Critical']),
   incidentDate: z.string().min(1, 'Select the incident date and time.'),
   address: z.string().min(5, 'Provide the full address.'),
@@ -119,6 +143,74 @@ const complaintSchema = z.object({
 type ComplaintFormValues = z.infer<typeof complaintSchema>
 
 function App() {
+  return isDemoMode ? <PortalRoutes /> : <ApiApplication />
+}
+
+function ApiApplication() {
+  const sessionQuery = useQuery({ queryKey: ['session'], queryFn: authService.getCurrentSession, retry: false })
+  const session = sessionQuery.data
+  const portalQuery = useQuery({
+    queryKey: ['portal-data', session?.role],
+    queryFn: () => fetchPortalData(session!.role),
+    enabled: Boolean(session),
+  })
+
+  useEffect(() => {
+    if (sessionQuery.isSuccess) useAppStore.setState({ session: sessionQuery.data })
+  }, [sessionQuery.data, sessionQuery.isSuccess])
+  useEffect(() => {
+    const handleExpiredSession = () => {
+      useAppStore.setState({
+        session: null,
+        complaints: [],
+        notifications: [],
+        departments: [],
+        categories: [],
+        officers: [],
+        citizens: [],
+        auditLogs: [],
+        dashboardStats: undefined,
+        prioritySlaHours: { Critical: 12, High: 24, Medium: 72, Low: 120 },
+      })
+      queryClient.removeQueries({ queryKey: ['portal-data'] })
+      queryClient.removeQueries({ queryKey: ['complaint-detail'] })
+      queryClient.setQueryData(['session'], null)
+    }
+    window.addEventListener('portal:session-expired', handleExpiredSession)
+    return () => window.removeEventListener('portal:session-expired', handleExpiredSession)
+  }, [])
+  useEffect(() => {
+    if (portalQuery.data) useAppStore.setState(portalQuery.data)
+  }, [portalQuery.data])
+
+  if (sessionQuery.isLoading) return <LoadingPage message="Restoring your secure session…" />
+  if (sessionQuery.isError) {
+    return <RetryPage message={getApiErrorMessage(sessionQuery.error)} onRetry={() => void sessionQuery.refetch()} />
+  }
+  if (session && portalQuery.isLoading) return <LoadingPage message="Loading your grievance workspace…" />
+  if (session && portalQuery.isError) {
+    return <RetryPage message={getApiErrorMessage(portalQuery.error)} onRetry={() => void portalQuery.refetch()} />
+  }
+  return <PortalRoutes />
+}
+
+function LoadingPage({ message }: { message: string }) {
+  return <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm font-medium text-slate-600">{message}</div>
+}
+
+function RetryPage({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-slate-50 px-4">
+      <div className="max-w-md rounded-2xl border border-slate-200 bg-white p-6 text-center shadow-sm">
+        <h1 className="text-xl font-bold text-slate-900">Service temporarily unavailable</h1>
+        <p role="alert" className="mt-2 text-sm text-slate-600">{message}</p>
+        <button onClick={onRetry} className="mt-5 rounded-xl bg-navy px-4 py-2.5 text-sm font-semibold text-white">Try again</button>
+      </div>
+    </div>
+  )
+}
+
+function PortalRoutes() {
   const session = useAppStore((state) => state.session)
 
   return (
@@ -142,8 +234,6 @@ function App() {
 
 function LandingPage() {
   const navigate = useNavigate()
-  const complaints = useAppStore((state) => state.complaints)
-  const resolvedCount = complaints.filter((complaint) => complaint.status === 'Resolved').length
 
   const enterDemo = (role: Role) => {
     const sessionMap = {
@@ -190,7 +280,7 @@ function LandingPage() {
         <section className="mx-auto grid max-w-7xl gap-8 px-6 pb-20 pt-16 lg:grid-cols-2 lg:items-center">
           <div>
             <div className="inline-flex items-center gap-2 rounded-full border border-sky-200 bg-sky-50 px-4 py-2 text-xs font-semibold text-sky-700">
-              <span className="h-2 w-2 rounded-full bg-emerald-500" /> Government of Haryana · Digital Services
+              <span className="h-2 w-2 rounded-full bg-emerald-500" /> Public grievance services
             </div>
             <h1 className="mt-6 text-5xl font-black leading-[0.94] tracking-[-0.05em] text-slate-900 md:text-7xl">
               Your voice.<br />
@@ -201,10 +291,10 @@ function LandingPage() {
               Report civic issues, track your grievances and help build a more accountable and responsive government service system.
             </p>
             <div className="mt-8 flex flex-wrap gap-3">
-              <button className="inline-flex items-center gap-2 rounded-xl bg-navy px-5 py-3 font-semibold text-white shadow-soft" onClick={() => enterDemo('citizen')}>
+              <button className="inline-flex items-center gap-2 rounded-xl bg-navy px-5 py-3 font-semibold text-white shadow-soft" onClick={() => isDemoMode ? enterDemo('citizen') : navigate('/login')}>
                 <Plus size={18} /> Submit a complaint
               </button>
-              <button className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-5 py-3 font-semibold text-navy" onClick={() => enterDemo('citizen')}>
+              <button className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-5 py-3 font-semibold text-navy" onClick={() => isDemoMode ? enterDemo('citizen') : navigate('/login')}>
                 Track a complaint <ArrowRight size={18} />
               </button>
             </div>
@@ -219,8 +309,7 @@ function LandingPage() {
             <div className="relative mx-auto max-w-lg rounded-3xl border border-slate-200 bg-white p-3 shadow-soft">
               <div className="flex items-center gap-3 border-b border-slate-100 px-4 py-3 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500">
                 <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-sky-100 text-blue-600"><ShieldCheck size={15} /></div>
-                Demo Service Snapshot
-                <span className="ml-auto h-2.5 w-2.5 rounded-full bg-emerald-500" />
+                Service map preview
               </div>
               <div className="relative h-64 overflow-hidden rounded-2xl bg-slate-100">
                 <div className="absolute inset-0 bg-[linear-gradient(30deg,transparent_44%,#d7e4f2_45%,#d7e4f2_47%,transparent_48%),linear-gradient(120deg,transparent_44%,#d7e4f2_45%,#d7e4f2_47%,transparent_48%)] bg-[length:72px_52px] opacity-70" />
@@ -232,32 +321,11 @@ function LandingPage() {
                 <div className="absolute right-24 bottom-12 flex h-8 w-8 -rotate-45 items-center justify-center rounded-full bg-emerald-500 text-white">
                   <MapPin size={15} />
                 </div>
-                <div className="absolute left-24 top-14 rounded-lg bg-white px-2 py-1 text-[10px] font-medium text-slate-600 shadow-sm">Roads & transport</div>
-                <div className="absolute bottom-10 right-8 rounded-lg bg-white px-2 py-1 text-[10px] font-medium text-slate-600 shadow-sm">Water & sanitation</div>
+                <div className="absolute left-24 top-14 rounded-lg bg-white px-2 py-1 text-[10px] font-medium text-slate-600 shadow-sm">Service area</div>
+                <div className="absolute bottom-10 right-8 rounded-lg bg-white px-2 py-1 text-[10px] font-medium text-slate-600 shadow-sm">Incident location</div>
               </div>
-              <div className="grid grid-cols-2 gap-6 px-4 py-4">
-                <div>
-                  <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Active requests</div>
-                  <div className="mt-2 text-3xl font-bold tracking-tight text-slate-900">{complaints.length}</div>
-                </div>
-                <div>
-                  <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Resolved</div>
-                  <div className="mt-2 text-3xl font-bold tracking-tight text-emerald-600">{resolvedCount}</div>
-                </div>
-              </div>
-            </div>
-            <div className="absolute left-0 top-24 flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-3 shadow-soft">
-              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-100 text-emerald-600"><CheckCircle2 size={18} /></div>
-              <div>
-                <div className="text-[11px] font-semibold text-slate-800">Complaint resolved</div>
-                <div className="text-[10px] text-slate-500">GRV-2026-00438</div>
-              </div>
-            </div>
-            <div className="absolute -bottom-2 right-0 flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-3 shadow-soft">
-              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-violet-100 text-violet-600"><Sparkles size={18} /></div>
-              <div>
-                <div className="text-[11px] font-semibold text-slate-800">AI-assisted routing</div>
-                <div className="text-[10px] text-slate-500">Right team, first time</div>
+              <div className="px-4 py-4 text-sm leading-6 text-slate-600">
+                Sign in to submit a grievance or track an existing reference number.
               </div>
             </div>
           </div>
@@ -266,10 +334,10 @@ function LandingPage() {
         <section className="bg-navy text-white">
           <div className="mx-auto grid max-w-7xl gap-0 md:grid-cols-4">
             {[
-              [String(complaints.length), 'Complaints submitted'],
-              [String(resolvedCount), 'Marked resolved'],
-              [`${complaints.length ? Math.round((resolvedCount / complaints.length) * 100) : 0}%`, 'Resolution rate'],
-              ['Demo', 'Sample records'],
+              ['Secure', 'Account access'],
+              ['Trackable', 'Status updates'],
+              ['Human-led', 'Service decisions'],
+              ['Private', 'Evidence storage'],
             ].map(([value, label]) => (
               <div key={label} className="border-r border-white/10 px-8 py-9 text-center last:border-r-0">
                 <div className="text-3xl font-black tracking-tight">{value}</div>
@@ -290,7 +358,7 @@ function LandingPage() {
           <div className="grid gap-7 md:grid-cols-4">
             {[
               { step: '01', icon: FileText, title: 'Submit your grievance', description: 'Share the details, location and supporting evidence in a few simple steps.' },
-              { step: '02', icon: Sparkles, title: 'We route it intelligently', description: 'The system helps identify the right category and department for quicker action.' },
+              { step: '02', icon: Building2, title: 'Reach the right department', description: 'Your selected category is associated with its configured service department.' },
               { step: '03', icon: Gauge, title: 'Track every update', description: 'Get clear status updates and know exactly what happens next.' },
               { step: '04', icon: CheckCircle2, title: 'See it get resolved', description: 'Receive the resolution details and help us improve your city.' },
             ].map(({ step, icon: Icon, title, description }) => (
@@ -350,20 +418,21 @@ function LandingPage() {
 
 function LoginPage() {
   const navigate = useNavigate()
-  const [form, setForm] = useState({ email: 'citizen@example.com', password: 'Demo@123' })
+  const [form, setForm] = useState({ email: isDemoMode ? 'citizen@example.com' : '', password: isDemoMode ? 'Demo@123' : '' })
   const [error, setError] = useState('')
 
-  const onSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+  const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    const user = authService.login(form.email, form.password)
-    if (!user) {
-      setError('Invalid credentials. Use the demo accounts listed on the page.')
+    setError('')
+    try {
+      const user = await authService.login(form.email, form.password)
+      if (!user) throw new Error('Invalid email or password.')
+      toast.success(`Welcome back, ${user.name}.`)
+      navigate(`/${user.role}/overview`)
+    } catch (loginError) {
+      setError(getApiErrorMessage(loginError, 'Invalid email or password.'))
       toast.error('Login failed. Please try again.')
-      return
     }
-
-    toast.success(`Welcome back, ${user.name}.`)
-    navigate(`/${user.role}/overview`)
   }
 
   const demoAccounts = [
@@ -389,18 +458,18 @@ function LoginPage() {
               <p className="mt-4 max-w-md text-sm leading-7 text-slate-300">Sign in to continue managing public grievances across citizen, officer and administrator workflows.</p>
             </div>
             <div className="grid gap-3">
-              {demoAccounts.map(([role, email, password]) => (
+              {isDemoMode ? demoAccounts.map(([role, email, password]) => (
                 <div key={role} className="rounded-xl border border-white/10 bg-white/5 p-3">
                   <div className="text-xs uppercase tracking-[0.18em] text-slate-300">{role}</div>
                   <div className="mt-2 text-sm font-medium text-white">{email}</div>
                   <div className="text-xs text-slate-300">{password}</div>
                 </div>
-              ))}
+              )) : <p className="text-sm leading-6 text-slate-300">Sign in with the account provided by your service administrator.</p>}
             </div>
           </div>
           <div className="p-8 lg:p-10">
             <div className="mb-6">
-              <div className="text-xs font-bold uppercase tracking-[0.22em] text-blue-600">Demo authentication</div>
+              <div className="text-xs font-bold uppercase tracking-[0.22em] text-blue-600">{isDemoMode ? 'Demo authentication' : 'Secure authentication'}</div>
               <h2 className="mt-2 text-3xl font-black tracking-[-0.05em] text-slate-900">Sign in</h2>
             </div>
             <form onSubmit={onSubmit} className="space-y-5">
@@ -408,6 +477,7 @@ function LoginPage() {
                 Email address
                 <input
                   type="email"
+                  required
                   value={form.email}
                   onChange={(event) => setForm((current) => ({ ...current, email: event.target.value }))}
                   className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-200"
@@ -417,6 +487,7 @@ function LoginPage() {
                 Password
                 <input
                   type="password"
+                  required
                   value={form.password}
                   onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))}
                   className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-200"
@@ -437,26 +508,28 @@ function RegisterPage() {
   const navigate = useNavigate()
   const [values, setValues] = useState({ name: '', email: '', password: '', confirmPassword: '' })
   const [error, setError] = useState('')
-  const submit = (event: React.FormEvent<HTMLFormElement>) => {
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    setError('')
     if (values.password !== values.confirmPassword) {
       setError('Passwords do not match.')
       return
     }
-    const result = authService.registerCitizen(values.name, values.email, values.password)
-    if (!result.user) {
-      setError(result.error ?? 'Unable to create the account.')
-      return
+    try {
+      const result = await authService.registerCitizen(values.name, values.email, values.password)
+      if (!result.user) throw new Error(result.error ?? 'Unable to create the account.')
+      toast.success(isDemoMode ? 'Demo citizen account created.' : 'Account created successfully.')
+      navigate('/citizen/overview', { replace: true })
+    } catch (registrationError) {
+      setError(getApiErrorMessage(registrationError, 'Unable to create the account.'))
     }
-    toast.success('Demo citizen account created.')
-    navigate('/citizen/overview', { replace: true })
   }
   return (
     <div className="flex min-h-screen items-center justify-center bg-slate-100 px-4 py-12">
       <div className="w-full max-w-lg rounded-3xl border border-slate-200 bg-white p-8 shadow-soft">
-        <div className="text-xs font-bold uppercase tracking-[0.22em] text-blue-600">Citizen registration · Demo</div>
+        <div className="text-xs font-bold uppercase tracking-[0.22em] text-blue-600">{isDemoMode ? 'Citizen registration · Demo' : 'Citizen registration'}</div>
         <h1 className="mt-2 text-3xl font-black tracking-[-0.05em] text-slate-900">Create an account</h1>
-        <p className="mt-2 text-sm text-slate-500">This account is stored locally in this browser for demonstration only.</p>
+        <p className="mt-2 text-sm text-slate-500">{isDemoMode ? 'This account exists only for this demonstration session.' : 'Your account is managed securely by the grievance service.'}</p>
         <form onSubmit={submit} className="mt-6 space-y-4">
           <label className="block text-sm font-medium text-slate-700">Full name
             <input required minLength={2} value={values.name} onChange={(event) => setValues((current) => ({ ...current, name: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
@@ -465,13 +538,13 @@ function RegisterPage() {
             <input required type="email" value={values.email} onChange={(event) => setValues((current) => ({ ...current, email: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
           </label>
           <label className="block text-sm font-medium text-slate-700">Password
-            <input required minLength={8} type="password" value={values.password} onChange={(event) => setValues((current) => ({ ...current, password: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
+            <input required minLength={isDemoMode ? 8 : 12} type="password" value={values.password} onChange={(event) => setValues((current) => ({ ...current, password: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
           </label>
           <label className="block text-sm font-medium text-slate-700">Confirm password
-            <input required minLength={8} type="password" value={values.confirmPassword} onChange={(event) => setValues((current) => ({ ...current, confirmPassword: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
+            <input required minLength={isDemoMode ? 8 : 12} type="password" value={values.confirmPassword} onChange={(event) => setValues((current) => ({ ...current, confirmPassword: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
           </label>
           {error ? <p role="alert" className="text-sm text-red-600">{error}</p> : null}
-          <button type="submit" className="w-full rounded-xl bg-navy px-4 py-3 font-semibold text-white">Create demo account</button>
+          <button type="submit" className="w-full rounded-xl bg-navy px-4 py-3 font-semibold text-white">Create account</button>
         </form>
         <p className="mt-5 text-center text-sm text-slate-500">Already registered? <button onClick={() => navigate('/login')} className="font-semibold text-blue-600">Sign in</button></p>
       </div>
@@ -482,8 +555,6 @@ function RegisterPage() {
 function DashboardLayout({ role }: { role: Role }) {
   const navigate = useNavigate()
   const location = useLocation()
-  const logout = useAppStore((state) => state.logout)
-  const addAuditEvent = useAppStore((state) => state.addAuditEvent)
   const session = useAppStore((state) => state.session)
   const notifications = useAppStore((state) => state.notifications)
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -492,10 +563,14 @@ function DashboardLayout({ role }: { role: Role }) {
   const unreadCount = notifications.filter((item) => !item.read && (!item.recipientEmail || item.recipientEmail === session?.email)).length
   const activeLabel = items.find((item) => location.pathname.startsWith(item.to))?.label ?? items[0].label
 
-  const handleLogout = () => {
-    addAuditEvent('Logged out')
-    logout()
-    navigate('/login')
+  const handleLogout = async () => {
+    try {
+      await authService.logout()
+      navigate('/login')
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Could not sign out cleanly.'))
+      navigate('/login')
+    }
   }
 
   return (
@@ -553,7 +628,7 @@ function DashboardLayout({ role }: { role: Role }) {
             </div>
             <div className="flex items-center gap-3">
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
-                Demo role: {role}
+                Workspace: {role}
               </div>
               <button aria-label="Open complaints" onClick={() => navigate(role === 'citizen' ? '/citizen/complaints' : role === 'officer' ? '/officer/assigned' : '/admin/complaints')} className="rounded-xl border border-slate-200 bg-white p-2"><Search size={18} /></button>
               <button aria-label={`Open ${role === 'citizen' ? 'notifications' : 'activity'}`} onClick={() => navigate(role === 'citizen' ? '/citizen/notifications' : role === 'officer' ? '/officer/assigned' : '/admin/audit-logs')} className="relative rounded-xl border border-slate-200 bg-white p-2">
@@ -576,9 +651,6 @@ function DashboardLayout({ role }: { role: Role }) {
               </> : null}
               {role === 'officer' ? <>
                 <Route path="assigned" element={<OfficerAssignments />} />
-                <Route path="department" element={<DepartmentComplaints />} />
-                <Route path="duplicates" element={<DuplicateReview />} />
-                <Route path="suspicious" element={<SuspiciousReview />} />
                 <Route path="reports" element={<OfficerReports />} />
                 <Route path="profile" element={<CitizenProfile />} />
               </> : null}
@@ -586,7 +658,6 @@ function DashboardLayout({ role }: { role: Role }) {
                 <Route path="complaints" element={<AdminAllComplaints />} />
                 <Route path="ai" element={<AdminMonitoring />} />
                 <Route path="duplicates" element={<DuplicateReview />} />
-                <Route path="fraud" element={<FraudReview />} />
                 <Route path="citizens" element={<CitizenManagement />} />
                 <Route path="officers" element={<OfficerManagement />} />
                 <Route path="departments" element={<DepartmentManagement />} />
@@ -594,7 +665,6 @@ function DashboardLayout({ role }: { role: Role }) {
                 <Route path="sla" element={<SlaManagement />} />
                 <Route path="reports" element={<AdminReports />} />
                 <Route path="audit-logs" element={<AuditLogs />} />
-                <Route path="settings" element={<AdminSettings />} />
                 <Route path="profile" element={<CitizenProfile />} />
               </> : null}
               <Route index element={<Navigate to="overview" replace />} />
@@ -723,26 +793,27 @@ function CitizenOverview() {
 
 function CitizenSubmitComplaint() {
   const navigate = useNavigate()
-  const session = useAppStore((state) => state.session)
   const allCategories = useAppStore((state) => state.categories)
   const categories = allCategories.filter((category) => category.active)
   const [imagePreviews, setImagePreviews] = useState<string[]>([])
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([])
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [pendingImageUpload, setPendingImageUpload] = useState<{ complaintId: string; trackingId: string } | null>(null)
+  const [locationConfirmed, setLocationConfirmed] = useState(false)
 
   const defaultValues: ComplaintFormValues = {
     title: '',
     description: '',
     category: categories[0]?.name ?? 'Sanitation',
-    subcategory: 'Drainage',
     severity: 'Medium',
     incidentDate: new Date().toISOString().slice(0, 16),
-    address: 'Sector 14 Market Road',
-    state: 'Haryana',
-    district: 'Gurugram',
-    city: 'Gurugram',
-    pincode: '122002',
-    latitude: 28.4595,
-    longitude: 77.0266,
+    address: '',
+    state: '',
+    district: '',
+    city: '',
+    pincode: '',
+    latitude: 20.5937,
+    longitude: 78.9629,
     remarks: '',
     consent: false,
   }
@@ -764,7 +835,7 @@ function CitizenSubmitComplaint() {
         continue
       }
       if (file.size > 512 * 1024) {
-        toast.error(`${file.name}: image must be 512 KB or smaller for browser demo storage.`)
+        toast.error(`${file.name}: image must be 512 KB or smaller.`)
         continue
       }
       if (accepted.length + imagePreviews.length >= 4) {
@@ -780,6 +851,7 @@ function CitizenSubmitComplaint() {
       reader.onerror = () => reject(new Error(`Could not read ${file.name}.`))
       reader.readAsDataURL(file)
     })))
+    setAttachedFiles((current) => [...current, ...accepted].slice(0, 4))
     setImagePreviews((current) => [...current, ...dataUrls].slice(0, 4))
   }
 
@@ -799,6 +871,7 @@ function CitizenSubmitComplaint() {
       ({ coords }) => {
         form.setValue('latitude', coords.latitude, { shouldValidate: true })
         form.setValue('longitude', coords.longitude, { shouldValidate: true })
+        setLocationConfirmed(true)
         toast.success('Current location captured.')
       },
       (error) => toast.error(error.message || 'Location permission was not granted.'),
@@ -807,47 +880,57 @@ function CitizenSubmitComplaint() {
   }
 
   const onSubmit = async (values: ComplaintFormValues) => {
+    if (!locationConfirmed) {
+      toast.error('Choose the incident location on the map or use your current location.')
+      return
+    }
     setIsSubmitting(true)
+    setPendingImageUpload(null)
     try {
-      await new Promise((resolve) => window.setTimeout(resolve, 350))
-      const complaint: Omit<Complaint, 'id' | 'createdAt' | 'lastUpdated'> = {
+      const selectedCategory = categories.find((category) => category.name === values.category)
+      if (!selectedCategory) throw new Error('The selected category is no longer available.')
+      const additionalDetails = values.remarks?.trim()
+      const description = additionalDetails ? `${values.description.trim()}\n\nAdditional details: ${additionalDetails}` : values.description.trim()
+      const created = await complaintService.createComplaint({
         title: values.title,
-        description: values.description,
-        category: values.category,
-        subcategory: values.subcategory,
-        severity: values.severity,
-        incidentDate: values.incidentDate,
-        address: values.address,
-        state: values.state,
-        district: values.district,
-        city: values.city,
-        pincode: values.pincode,
-        latitude: values.latitude,
-        longitude: values.longitude,
-        remarks: [values.remarks || 'Complaint filed and awaiting review.'],
-        consent: values.consent,
-        status: 'Pending',
-        priority: values.severity,
-        department: selectedCategory?.department ?? 'Municipal Corporation',
-        assignedOfficer: 'Priya Sharma',
-        citizenName: session?.name ?? 'Citizen User',
-        citizenEmail: session?.email ?? 'citizen@example.com',
-        images: imagePreviews,
-        riskScore: 18,
-        ai: {
-          predictedCategory: values.category,
-          suggestedDepartment: selectedCategory?.department ?? 'Municipal Corporation',
-          duplicateWarning: 'No duplicate signal found in local review.',
-          confidence: 91,
-          imageRisk: 15,
+        description,
+        categoryId: selectedCategory.id,
+        severity: values.severity.toUpperCase() as ComplaintSubmission['severity'],
+        incidentAt: new Date(values.incidentDate).toISOString(),
+        consent: true,
+        location: {
+          address: values.address,
+          state: values.state,
+          district: values.district,
+          city: values.city,
+          pincode: values.pincode,
+          latitude: values.latitude,
+          longitude: values.longitude,
         },
-      }
-
-      const created = complaintService.createComplaint(complaint)
+      }, attachedFiles)
       toast.success(`Complaint ${created.id} submitted successfully.`)
       navigate(`/citizen/track?complaint=${encodeURIComponent(created.id)}`)
     } catch (error) {
+      if (error instanceof ComplaintImageUploadError) {
+        setPendingImageUpload({ complaintId: error.complaint.recordId ?? '', trackingId: error.complaint.id })
+        toast.error(`Complaint ${error.complaint.id} was created, but the images did not upload.`)
+        return
+      }
       toast.error(error instanceof Error ? `Complaint could not be saved: ${error.message}` : 'Complaint could not be saved.')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  const retryImageUpload = async () => {
+    if (!pendingImageUpload?.complaintId) return
+    setIsSubmitting(true)
+    try {
+      await complaintService.uploadImages(pendingImageUpload.complaintId, attachedFiles)
+      toast.success('Complaint images uploaded.')
+      navigate(`/citizen/track?complaint=${encodeURIComponent(pendingImageUpload.trackingId)}`)
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Images could not be uploaded. Try again.'))
     } finally {
       setIsSubmitting(false)
     }
@@ -882,16 +965,6 @@ function CitizenSubmitComplaint() {
                   {categories.map((category) => <option key={category.id} value={category.name}>{category.name}</option>)}
                 </select>
                 {form.formState.errors.category ? <p className="mt-1 text-xs text-red-600">{form.formState.errors.category.message}</p> : null}
-              </div>
-              <div>
-                <label className="text-sm font-medium text-slate-700">Subcategory</label>
-                <select {...form.register('subcategory')} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
-                  <option>Drainage</option>
-                  <option>Public lighting</option>
-                  <option>Pothole</option>
-                  <option>Water leakage</option>
-                  <option>Garbage pickup</option>
-                </select>
               </div>
               <div>
                 <label className="text-sm font-medium text-slate-700">Severity</label>
@@ -937,16 +1010,16 @@ function CitizenSubmitComplaint() {
                 <button type="button" onClick={useCurrentLocation} className="text-sm font-semibold text-blue-600">Use my current location</button>
               </div>
               <div className="mt-3 h-64 overflow-hidden rounded-2xl border border-slate-200 bg-slate-50">
-                <LocationMap lat={form.watch('latitude')} lng={form.watch('longitude')} onSelect={(latitude, longitude) => { form.setValue('latitude', latitude); form.setValue('longitude', longitude) }} />
+                <LocationMap lat={form.watch('latitude')} lng={form.watch('longitude')} onSelect={(latitude, longitude) => { form.setValue('latitude', latitude); form.setValue('longitude', longitude); setLocationConfirmed(true) }} />
               </div>
               <div className="mt-3 grid gap-4 md:grid-cols-2">
                 <div>
                   <label className="text-sm font-medium text-slate-700">Latitude</label>
-                  <input type="number" step="any" value={form.watch('latitude')} onChange={(event) => form.setValue('latitude', Number(event.target.value), { shouldValidate: true })} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
+                  <input type="number" step="any" value={form.watch('latitude')} onChange={(event) => { form.setValue('latitude', Number(event.target.value), { shouldValidate: true }); setLocationConfirmed(true) }} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
                 </div>
                 <div>
                   <label className="text-sm font-medium text-slate-700">Longitude</label>
-                  <input type="number" step="any" value={form.watch('longitude')} onChange={(event) => form.setValue('longitude', Number(event.target.value), { shouldValidate: true })} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
+                  <input type="number" step="any" value={form.watch('longitude')} onChange={(event) => { form.setValue('longitude', Number(event.target.value), { shouldValidate: true }); setLocationConfirmed(true) }} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
                 </div>
               </div>
             </div>
@@ -978,7 +1051,10 @@ function CitizenSubmitComplaint() {
                   {imagePreviews.map((src, index) => (
                     <div key={src} className="relative overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
                       <img src={src} alt={`Preview ${index + 1}`} className="h-28 w-full object-cover" />
-                      <button type="button" className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full bg-white/90 text-slate-700" onClick={() => setImagePreviews((current) => current.filter((item) => item !== src))}>
+                      <button type="button" className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full bg-white/90 text-slate-700" onClick={() => {
+                        setImagePreviews((current) => current.filter((_, currentIndex) => currentIndex !== index))
+                        setAttachedFiles((current) => current.filter((_, currentIndex) => currentIndex !== index))
+                      }}>
                         <X size={14} />
                       </button>
                     </div>
@@ -996,6 +1072,10 @@ function CitizenSubmitComplaint() {
             <div className="flex justify-end">
               <button type="submit" disabled={isSubmitting} className="rounded-xl bg-navy px-5 py-3 text-sm font-semibold text-white disabled:cursor-wait disabled:opacity-60">{isSubmitting ? 'Submitting…' : 'Submit grievance'}</button>
             </div>
+            {pendingImageUpload ? <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+              <span>Complaint {pendingImageUpload.trackingId} is saved. Upload its supporting images to complete submission.</span>
+              <button type="button" disabled={isSubmitting} onClick={() => void retryImageUpload()} className="rounded-lg bg-amber-700 px-3 py-2 font-semibold text-white disabled:opacity-50">{isSubmitting ? 'Uploading…' : 'Retry image upload'}</button>
+            </div> : null}
           </div>
         </form>
 
@@ -1003,33 +1083,29 @@ function CitizenSubmitComplaint() {
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-white text-blue-600"><Sparkles size={18} /></div>
             <div>
-              <div className="text-sm font-bold text-slate-900">AI routing preview</div>
-              <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">DEMO DATA</div>
+              <div className="text-sm font-bold text-slate-900">Complaint routing</div>
+              <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">SERVICE METADATA</div>
             </div>
           </div>
           <div className="mt-5 space-y-4 text-sm">
             <div className="rounded-xl border border-sky-200 bg-white p-3">
-              <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Predicted category</div>
+              <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Selected category</div>
               <div className="mt-2 flex items-center justify-between gap-3">
                 <span className="font-semibold text-slate-800">{watchedCategory}</span>
-                <Pill className="bg-emerald-100 text-emerald-700">{Math.max(88, 90 + (watchedSeverity === 'Critical' ? 6 : watchedSeverity === 'High' ? 3 : 0))}%</Pill>
+                <Pill className="bg-slate-100 text-slate-600">{watchedSeverity}</Pill>
               </div>
             </div>
             <div className="rounded-xl border border-sky-200 bg-white p-3">
               <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Suggested department</div>
               <div className="mt-2 font-semibold text-slate-800">{selectedCategory?.department ?? 'Municipal Corporation'}</div>
             </div>
-            <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
-              <div className="text-[10px] uppercase tracking-[0.18em] text-amber-700">Potential duplicate warning</div>
-              <div className="mt-2 flex items-center gap-2 text-sm font-semibold text-slate-800"><AlertTriangle size={15} /> Similar complaint found</div>
-              <div className="mt-1 text-xs text-slate-600">GRV-2026-00476 · 86% similarity</div>
-            </div>
             <div className="rounded-xl border border-sky-200 bg-white p-3">
-              <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Image risk indicators</div>
-              <div className="mt-2 text-sm font-semibold text-slate-800">{imagePreviews.length ? 'Low to moderate risk' : 'Awaiting evidence review'}</div>
+              <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Automated analysis</div>
+              <div className="mt-2 text-sm font-semibold text-slate-800">Not configured</div>
+              <div className="mt-1 text-xs text-slate-600">No AI score or duplicate determination is generated.</div>
             </div>
           </div>
-          <p className="mt-5 text-xs leading-6 text-slate-500">AI suggestions are only demonstration feedback and must be reviewed by an officer before any action is finalized.</p>
+          <p className="mt-5 text-xs leading-6 text-slate-500">Category and department information comes from the grievance service and is not an automated decision.</p>
         </aside>
       </div>
     </>
@@ -1077,11 +1153,12 @@ function CitizenComplaints() {
           <select value={status} onChange={(event) => { setStatus(event.target.value); setPage(1) }} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-700">
             <option>All</option>
             <option>Pending</option>
+            <option>AI Analysis</option>
             <option>Assigned</option>
             <option>In Progress</option>
             <option>Under Review</option>
             <option>Resolved</option>
-            <option>Escalated</option>
+            <option>Closed</option>
             <option>Escalated</option>
           </select>
           <select value={category} onChange={(event) => { setCategory(event.target.value); setPage(1) }} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-700">
@@ -1143,7 +1220,73 @@ function TrackComplaint() {
   const [searchParams, setSearchParams] = useSearchParams()
   const [query, setQuery] = useState(searchParams.get('complaint') ?? '')
   const selectedId = searchParams.get('complaint') ?? ''
-  const selectedComplaint = complaints.find((complaint) => complaint.id.toLowerCase() === selectedId.trim().toLowerCase())
+  const cachedComplaint = complaints.find((complaint) => complaint.id.toLowerCase() === selectedId.trim().toLowerCase())
+  const detailQuery = useQuery({
+    queryKey: ['complaint-detail', selectedId],
+    queryFn: () => complaintService.getComplaintByTrackingId(selectedId),
+    enabled: !isDemoMode && Boolean(selectedId),
+    retry: false,
+  })
+  const selectedComplaint = isDemoMode ? cachedComplaint : detailQuery.data ?? cachedComplaint
+  const [images, setImages] = useState<string[]>([])
+  const [resolutionImages, setResolutionImages] = useState<string[]>([])
+  const [imagesLoading, setImagesLoading] = useState(false)
+  const [feedbackRating, setFeedbackRating] = useState(5)
+  const [feedbackComment, setFeedbackComment] = useState('')
+  const [feedbackSubmitted, setFeedbackSubmitted] = useState(false)
+
+  useEffect(() => {
+    if (isDemoMode || !selectedComplaint?.recordId || (!selectedComplaint.imageIds?.length && !selectedComplaint.resolutionEvidenceIds?.length)) {
+      setImages([])
+      setResolutionImages([])
+      setImagesLoading(false)
+      return
+    }
+    let active = true
+    let urls: string[] = []
+    setImages([])
+    setResolutionImages([])
+    setImagesLoading(true)
+    const complaintId = selectedComplaint.recordId
+    const fetchImages = (ids: string[], resolution = false) => Promise.all(ids.map(async (id) => {
+      try {
+        return await complaintService.fetchComplaintImage(complaintId, id, resolution)
+      } catch (error) {
+        toast.error(getApiErrorMessage(error, 'Complaint images could not be loaded.'))
+        return null
+      }
+    }))
+    void Promise.all([
+      fetchImages(selectedComplaint.imageIds ?? []),
+      fetchImages(selectedComplaint.resolutionEvidenceIds ?? [], true),
+    ]).then(([complaintResults, evidenceResults]) => {
+      const complaintImages = complaintResults.filter((url): url is string => Boolean(url))
+      const evidenceImages = evidenceResults.filter((url): url is string => Boolean(url))
+      urls = [...complaintImages, ...evidenceImages]
+      if (active) {
+        setImages(complaintImages)
+        setResolutionImages(evidenceImages)
+      } else urls.forEach((url) => URL.revokeObjectURL(url))
+    }).finally(() => { if (active) setImagesLoading(false) })
+    return () => {
+      active = false
+      urls.forEach((url) => URL.revokeObjectURL(url))
+    }
+  }, [selectedComplaint?.recordId, selectedComplaint?.imageIds, selectedComplaint?.resolutionEvidenceIds])
+  const complaintImages = isDemoMode ? selectedComplaint?.images ?? [] : images
+  const complaintResolutionImages = isDemoMode ? selectedComplaint?.resolutionImages ?? [] : resolutionImages
+
+  const submitFeedback = async () => {
+    if (!selectedComplaint) return
+    try {
+      await complaintService.submitFeedback(selectedComplaint.id, feedbackRating, feedbackComment.trim() || undefined)
+      setFeedbackSubmitted(true)
+      toast.success('Thank you for your feedback.')
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Feedback could not be submitted.'))
+    }
+    useEffect(() => setFeedbackSubmitted(false), [selectedId])
+  }
 
   return (
     <>
@@ -1155,6 +1298,8 @@ function TrackComplaint() {
             <input id="complaint-tracking-id" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="e.g. GRV-2026-000001" className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
             <button type="submit" className="mt-3 w-full rounded-xl bg-navy px-4 py-2.5 text-sm font-semibold text-white">Track complaint</button>
           </form>
+          {detailQuery.isLoading ? <p className="mt-4 text-sm text-slate-500">Loading complaint details…</p> : null}
+          {detailQuery.isError ? <p role="alert" className="mt-4 text-sm text-red-600">{getApiErrorMessage(detailQuery.error, 'Complaint details could not be loaded.')}</p> : null}
           {selectedComplaint ? (
             <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
               <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Current status</div>
@@ -1213,15 +1358,27 @@ function TrackComplaint() {
               </section>
               <section>
                 <h3 className="text-xs font-bold uppercase tracking-[0.18em] text-slate-400">Evidence and review preview</h3>
-                {selectedComplaint.images.length ? <div className="mt-3 grid grid-cols-2 gap-2">{selectedComplaint.images.map((image, index) => <img key={`${selectedComplaint.id}-${index}`} src={image} alt={`Evidence ${index + 1}`} className="h-28 w-full rounded-lg object-cover" />)}</div> : <p className="mt-3 text-sm text-slate-500">No evidence images attached.</p>}
-                {selectedComplaint.resolutionImages?.length ? <div className="mt-4"><div className="text-xs font-semibold text-slate-600">Resolution evidence</div><div className="mt-2 grid grid-cols-2 gap-2">{selectedComplaint.resolutionImages.map((image, index) => <img key={`${selectedComplaint.id}-resolution-${index}`} src={image} alt={`Resolution evidence ${index + 1}`} className="h-28 w-full rounded-lg object-cover" />)}</div></div> : null}
+                {complaintImages.length ? <div className="mt-3 grid grid-cols-2 gap-2">{complaintImages.map((image, index) => <img key={`${selectedComplaint.id}-${index}`} src={image} alt={`Evidence ${index + 1}`} className="h-28 w-full rounded-lg object-cover" />)}</div> : <p className="mt-3 text-sm text-slate-500">{imagesLoading ? 'Loading evidence images…' : selectedComplaint.imageIds?.length ? 'Evidence images are unavailable.' : 'No evidence images attached.'}</p>}
+                {complaintResolutionImages.length ? <div className="mt-4"><div className="text-xs font-semibold text-slate-600">Resolution evidence</div><div className="mt-2 grid grid-cols-2 gap-2">{complaintResolutionImages.map((image, index) => <img key={`${selectedComplaint.id}-resolution-${index}`} src={image} alt={`Resolution evidence ${index + 1}`} className="h-28 w-full rounded-lg object-cover" />)}</div></div> : null}
                 <div className="mt-4 rounded-xl border border-sky-200 bg-sky-50 p-4 text-sm">
-                  <div className="font-semibold text-slate-800">Simulated AI review · human verification required</div>
-                  <div className="mt-2 text-slate-600">Category: {selectedComplaint.ai.predictedCategory} ({selectedComplaint.ai.confidence}% demo confidence)</div>
-                  <div className="mt-1 text-slate-600">Risk score: {selectedComplaint.riskScore} · {selectedComplaint.ai.duplicateWarning}</div>
+                  <div className="font-semibold text-slate-800">Automated analysis status</div>
+                  <div className="mt-2 text-slate-600">{selectedComplaint.aiStatus ?? 'NOT_CONFIGURED'}</div>
+                  <div className="mt-1 text-xs text-slate-600">No confidence or risk score is available unless an analysis service is configured.</div>
                 </div>
               </section>
             </div>
+            {['Resolved', 'Closed'].includes(selectedComplaint.status) ? <section className="mt-8 rounded-xl border border-slate-200 bg-white p-4">
+              <h3 className="font-semibold text-slate-900">Rate this resolution</h3>
+              {selectedComplaint.feedback || feedbackSubmitted ? <p className="mt-2 text-sm text-emerald-700">Feedback submitted · {selectedComplaint.feedback?.rating ?? feedbackRating}/5. Thank you.</p> : <div className="mt-3 flex flex-wrap items-end gap-3">
+                <label className="text-sm text-slate-600">Rating
+                  <select value={feedbackRating} onChange={(event) => setFeedbackRating(Number(event.target.value))} className="mt-1 block rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">{[1, 2, 3, 4, 5].map((rating) => <option key={rating} value={rating}>{rating}</option>)}</select>
+                </label>
+                <label className="min-w-52 flex-1 text-sm text-slate-600">Comment
+                  <input value={feedbackComment} onChange={(event) => setFeedbackComment(event.target.value)} maxLength={2000} className="mt-1 block w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2" />
+                </label>
+                <button onClick={() => void submitFeedback()} className="rounded-lg bg-navy px-4 py-2 text-sm font-semibold text-white">Submit feedback</button>
+              </div>}
+            </section> : null}
           </div>
         ) : null}
       </div>
@@ -1234,15 +1391,21 @@ function CitizenNotifications() {
   const allComplaints = useAppStore((state) => state.complaints)
   const complaintIds = allComplaints.filter((complaint) => complaint.citizenEmail === session?.email).map((complaint) => complaint.id)
   const allNotifications = useAppStore((state) => state.notifications)
-  const notifications = allNotifications.filter((item) => item.recipientEmail === session?.email || (!item.recipientEmail && item.complaintId && complaintIds.includes(item.complaintId)))
+  const notifications = isDemoMode
+    ? allNotifications.filter((item) => item.recipientEmail === session?.email || (!item.recipientEmail && item.complaintId && complaintIds.includes(item.complaintId)))
+    : allNotifications
   const [filter, setFilter] = useState('All')
-  const markNotificationRead = useAppStore((state) => state.markNotificationRead)
-  const markAllNotificationsRead = useAppStore((state) => state.markAllNotificationsRead)
   const navigate = useNavigate()
+  const markRead = async (id: string) => {
+    try { await notificationService.markAsRead(id) } catch (error) { toast.error(getApiErrorMessage(error, 'Notification could not be updated.')) }
+  }
+  const markAllRead = async () => {
+    try { await notificationService.markAllAsRead() } catch (error) { toast.error(getApiErrorMessage(error, 'Notifications could not be updated.')) }
+  }
 
   return (
     <>
-      <SectionHeader eyebrow="Notifications" title="Updates and alerts" description="Stay informed about changes, assignments and decisions related to your complaints." action={<div className="flex gap-2"><select value={filter} onChange={(event) => setFilter(event.target.value)} className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"><option>All</option><option>Unread</option><option>Read</option></select><button className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => markAllNotificationsRead(session?.email)}>Mark all as read</button></div>} />
+      <SectionHeader eyebrow="Notifications" title="Updates and alerts" description="Stay informed about changes, assignments and decisions related to your complaints." action={<div className="flex gap-2"><select value={filter} onChange={(event) => setFilter(event.target.value)} className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"><option>All</option><option>Unread</option><option>Read</option></select><button className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => void markAllRead()}>Mark all as read</button></div>} />
       <div className="space-y-4">
         {notifications.filter((item) => filter === 'All' || (filter === 'Unread' ? !item.read : item.read)).map((item) => (
           <div key={item.id} className={`rounded-2xl border p-4 shadow-sm ${item.read ? 'border-slate-200 bg-white' : 'border-blue-200 bg-blue-50'}`}>
@@ -1254,7 +1417,7 @@ function CitizenNotifications() {
                 {item.complaintId ? <button onClick={() => navigate(`/citizen/track?complaint=${encodeURIComponent(item.complaintId!)}`)} className="mt-3 text-xs font-semibold text-blue-600">View complaint</button> : null}
               </div>
               {!item.read ? (
-                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700" onClick={() => markNotificationRead(item.id)}>Mark read</button>
+                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700" onClick={() => void markRead(item.id)}>Mark read</button>
               ) : null}
             </div>
           </div>
@@ -1269,11 +1432,10 @@ function CitizenProfile() {
   const session = useAppStore((state) => state.session)
   const citizen = useAppStore((state) => state.citizens.find((item) => item.email === session?.email))
   const officer = useAppStore((state) => state.officers.find((item) => item.email === session?.email))
-  const updateProfile = useAppStore((state) => state.updateProfile)
   const defaults = {
     name: citizen?.name ?? session?.name ?? '',
     phone: citizen?.phone ?? officer?.phone ?? '',
-    address: citizen?.address ?? officer?.address ?? '',
+    address: citizen?.address ?? officer?.jurisdiction ?? '',
     state: citizen?.state ?? officer?.state ?? '',
     district: citizen?.district ?? officer?.district ?? '',
     city: citizen?.city ?? officer?.city ?? '',
@@ -1281,14 +1443,18 @@ function CitizenProfile() {
   }
   const [profile, setProfile] = useState(defaults)
   const [editing, setEditing] = useState(false)
-  const save = () => {
+  const save = async () => {
     if (profile.name.trim().length < 2 || (session?.role === 'citizen' && (!/^\+?[0-9\s-]{8,16}$/.test(profile.phone) || profile.address.trim().length < 5 || !/^\d{6}$/.test(profile.pincode)))) {
       toast.error(session?.role === 'citizen' ? 'Enter a valid name, phone number, address and 6-digit pincode.' : 'Enter a valid name.')
       return
     }
-    updateProfile(profile)
-    setEditing(false)
-    toast.success('Profile updated.')
+    try {
+      await authService.updateProfile(profile)
+      setEditing(false)
+      toast.success('Profile updated.')
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Profile could not be updated.'))
+    }
   }
   return (
     <>
@@ -1319,28 +1485,31 @@ function CitizenProfile() {
               <input disabled={!editing} value={profile.phone} onChange={(event) => setProfile((current) => ({ ...current, phone: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 disabled:text-slate-500" />
             </div>
             <div className="md:col-span-2">
-              <label className="text-sm font-medium text-slate-700">Address</label>
+              <label className="text-sm font-medium text-slate-700">{session?.role === 'officer' ? 'Jurisdiction' : 'Address'}</label>
               <input disabled={!editing} value={profile.address} onChange={(event) => setProfile((current) => ({ ...current, address: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 disabled:text-slate-500" />
             </div>
-            <div>
+            {session?.role === 'citizen' ? <div>
               <label className="text-sm font-medium text-slate-700">State</label>
               <input disabled={!editing} value={profile.state} onChange={(event) => setProfile((current) => ({ ...current, state: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 disabled:text-slate-500" />
             </div>
-            <div>
+            : null}
+            {session?.role === 'citizen' ? <div>
               <label className="text-sm font-medium text-slate-700">District</label>
               <input disabled={!editing} value={profile.district} onChange={(event) => setProfile((current) => ({ ...current, district: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 disabled:text-slate-500" />
             </div>
-            <div>
+            : null}
+            {session?.role === 'citizen' ? <div>
               <label className="text-sm font-medium text-slate-700">City</label>
               <input disabled={!editing} value={profile.city} onChange={(event) => setProfile((current) => ({ ...current, city: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 disabled:text-slate-500" />
             </div>
-            <div>
+            : null}
+            {session?.role === 'citizen' ? <div>
               <label className="text-sm font-medium text-slate-700">Pincode</label>
               <input disabled={!editing} value={profile.pincode} onChange={(event) => setProfile((current) => ({ ...current, pincode: event.target.value }))} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 disabled:text-slate-500" />
-            </div>
+            </div> : null}
           </div>
           <div className="mt-6 flex gap-2">
-            {!editing ? <button onClick={() => setEditing(true)} className="rounded-xl bg-navy px-4 py-3 text-sm font-semibold text-white">Edit profile</button> : <>
+            {session?.role === 'admin' ? <p className="text-sm text-slate-500">Administrator profile details are managed by the service operator.</p> : !editing ? <button onClick={() => setEditing(true)} className="rounded-xl bg-navy px-4 py-3 text-sm font-semibold text-white">Edit profile</button> : <>
               <button onClick={save} className="rounded-xl bg-navy px-4 py-3 text-sm font-semibold text-white">Save changes</button>
               <button onClick={() => { setProfile(defaults); setEditing(false) }} className="rounded-xl border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700">Cancel</button>
             </>}
@@ -1354,17 +1523,22 @@ function CitizenProfile() {
 function OfficerOverview() {
   const complaints = useAppStore((state) => state.complaints)
   const session = useAppStore((state) => state.session)
+  const categories = useAppStore((state) => state.categories)
+  const prioritySlaHours = useAppStore((state) => state.prioritySlaHours)
   const officerComplaints = complaints.filter((complaint) => complaint.assignedOfficer === session?.name)
-  const overdueCount = officerComplaints.filter((complaint) =>
-    complaint.status !== 'Resolved' && Date.now() - new Date(complaint.createdAt).getTime() > 72 * 60 * 60 * 1000,
-  ).length
+  const overdueCount = officerComplaints.filter((complaint) => {
+    if (complaint.status === 'Resolved' || complaint.status === 'Closed') return false
+    const category = categories.find((item) => item.name === complaint.category)
+    const targetHours = Math.min(category?.slaHours ?? 72, prioritySlaHours[complaint.priority])
+    return Date.now() > new Date(complaint.createdAt).getTime() + targetHours * 60 * 60 * 1000
+  }).length
 
   const stats = [
     { label: 'Assigned complaints', value: String(officerComplaints.length), note: 'Current load', icon: ClipboardCheck, tone: 'blue' },
     { label: 'Pending', value: String(officerComplaints.filter((item) => item.status === 'Pending').length), note: 'Awaiting review', icon: Gauge, tone: 'amber' },
     { label: 'In progress', value: String(officerComplaints.filter((item) => item.status === 'In Progress').length), note: 'Active cases', icon: TrendingUp, tone: 'violet' },
     { label: 'Resolved', value: String(officerComplaints.filter((item) => item.status === 'Resolved').length), note: 'Completed', icon: CheckCircle2, tone: 'green' },
-    { label: 'Overdue', value: String(overdueCount), note: 'Open over 72 hours', icon: AlertTriangle, tone: 'amber' },
+    { label: 'Past target', value: String(overdueCount), note: 'Open beyond configured SLA', icon: AlertTriangle, tone: 'amber' },
   ]
 
   const chartData = [
@@ -1419,7 +1593,9 @@ function OfficerAssignments() {
   const [statusFilter, setStatusFilter] = useState('All')
   const [page, setPage] = useState(1)
   const [remarks, setRemarks] = useState<Record<string, string>>({})
-  const assigned = complaints.filter((complaint) => complaint.assignedOfficer === session?.name)
+  const assigned = isDemoMode
+    ? complaints.filter((complaint) => complaint.assignedOfficer === session?.name)
+    : complaints
   const filtered = assigned.filter((complaint) => {
     const text = `${complaint.id} ${complaint.title} ${complaint.category} ${complaint.city}`.toLowerCase()
     return text.includes(query.toLowerCase()) && (statusFilter === 'All' || complaint.status === statusFilter)
@@ -1434,7 +1610,7 @@ function OfficerAssignments() {
       <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
         <div className="mb-4 flex flex-col gap-3 sm:flex-row">
           <label className="flex flex-1 items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5"><Search size={16} className="text-slate-400" /><input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1) }} placeholder="Search ID, title, category or location" className="w-full bg-transparent text-sm outline-none" /></label>
-          <select aria-label="Filter assignments by status" value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); setPage(1) }} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm">{['All', 'Pending', 'Assigned', 'In Progress', 'Under Review', 'Resolved', 'Escalated'].map((item) => <option key={item}>{item}</option>)}</select>
+          <select aria-label="Filter assignments by status" value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); setPage(1) }} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm">{['All', 'Pending', 'AI Analysis', 'Assigned', 'In Progress', 'Under Review', 'Resolved', 'Closed', 'Escalated'].map((item) => <option key={item}>{item}</option>)}</select>
         </div>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
@@ -1463,14 +1639,12 @@ function OfficerAssignments() {
                   <td className="py-3 pr-4"><StatusBadge status={complaint.status} /></td>
                   <td className="py-3">
                     <select value={complaint.status} onChange={(event) => {
-                      complaintService.updateComplaintStatus(complaint.id, event.target.value as ComplaintStatus, session?.name)
-                      toast.success(`Updated ${complaint.id}.`)
+                      void complaintService.updateComplaintStatus(complaint.id, event.target.value as ComplaintStatus, session?.name).then(
+                        () => toast.success(`Updated ${complaint.id}.`),
+                        (error: unknown) => toast.error(getApiErrorMessage(error, 'Status could not be updated.')),
+                      )
                     }} className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs text-slate-700">
-                      <option>Pending</option>
-                      <option>Assigned</option>
-                      <option>In Progress</option>
-                      <option>Under Review</option>
-                      <option>Resolved</option>
+                      {[complaint.status, ...getAvailableStatuses(complaint.status)].map((status) => <option key={status}>{status}</option>)}
                     </select>
                   </td>
                   <td className="py-3">
@@ -1478,9 +1652,10 @@ function OfficerAssignments() {
                       event.preventDefault()
                       const note = remarks[complaint.id]?.trim()
                       if (!note) { toast.error('Enter an investigation note first.'); return }
-                      complaintService.addRemark(complaint.id, note)
-                      setRemarks((current) => ({ ...current, [complaint.id]: '' }))
-                      toast.success('Investigation note added.')
+                      void complaintService.addRemark(complaint.id, note).then(() => {
+                        setRemarks((current) => ({ ...current, [complaint.id]: '' }))
+                        toast.success('Investigation note added.')
+                      }, (error: unknown) => toast.error(getApiErrorMessage(error, 'Investigation note could not be saved.')))
                     }}>
                       <input value={remarks[complaint.id] ?? ''} onChange={(event) => setRemarks((current) => ({ ...current, [complaint.id]: event.target.value }))} placeholder="Add a note" className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-xs" />
                       <button type="submit" className="rounded-lg bg-navy px-2 py-1 text-xs font-semibold text-white">Add</button>
@@ -1495,23 +1670,12 @@ function OfficerAssignments() {
                         toast.error('Choose a JPG, PNG or WEBP image under 512 KB.')
                         return
                       }
-                      const reader = new FileReader()
-                      reader.onload = () => {
-                        if (typeof reader.result !== 'string') {
-                          toast.error('Unable to read the selected image.')
-                          return
-                        }
-                        try {
-                          complaintService.addResolutionImage(complaint.id, reader.result)
-                          toast.success('Resolution evidence saved.')
-                        } catch (error) {
-                          toast.error(error instanceof Error ? error.message : 'Resolution evidence could not be saved.')
-                        }
-                      }
-                      reader.onerror = () => toast.error('Unable to read the selected image.')
-                      reader.readAsDataURL(file)
+                      void complaintService.addResolutionImage(complaint.id, file).then(
+                        () => toast.success('Resolution evidence saved.'),
+                        (error: unknown) => toast.error(getApiErrorMessage(error, 'Resolution evidence could not be saved.')),
+                      )
                     }} />
-                    {complaint.resolutionImages?.length ? <div className="mt-2 text-xs text-emerald-700">{complaint.resolutionImages.length} resolution image(s)</div> : null}
+                    <ResolutionEvidencePreview complaint={complaint} />
                   </td>
                 </tr>
               ))}
@@ -1525,121 +1689,105 @@ function OfficerAssignments() {
   )
 }
 
-function DepartmentComplaints() {
-  const session = useAppStore((state) => state.session)
-  const complaints = useAppStore((state) => state.complaints)
-  const officer = useAppStore((state) => state.officers.find((item) => item.email === session?.email))
-  const departmentComplaints = complaints.filter((item) => item.department === officer?.department)
-  return (
-    <>
-      <SectionHeader eyebrow="Department view" title="Department complaints" description="Monitor complaint volumes and review all issues waiting in your department queue." />
-      <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-        <div className="grid gap-4 md:grid-cols-3">
-          {['Pending review', 'Assigned', 'Resolved'].map((value) => (
-            <div key={value} className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-              <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{value}</div>
-              <div className="mt-2 text-3xl font-black tracking-[-0.05em] text-slate-900">{departmentComplaints.filter((item) => value === 'Pending review' ? item.status === 'Pending' : item.status === value).length}</div>
-            </div>
-          ))}
-        </div>
-        <div className="mt-6 space-y-3">
-          {departmentComplaints.map((item) => <div key={item.id} className="flex flex-col gap-2 rounded-xl border border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
-            <div><div className="font-semibold text-slate-900">{item.title}</div><div className="text-xs text-slate-500">{item.id} · {item.city}</div></div>
-            <StatusBadge status={item.status} />
-          </div>)}
-          {!departmentComplaints.length ? <p className="py-4 text-sm text-slate-500">No complaints are currently associated with your department.</p> : null}
-        </div>
-      </div>
-    </>
-  )
+function ResolutionEvidencePreview({ complaint }: { complaint: Complaint }) {
+  const [images, setImages] = useState<string[]>([])
+  const [loading, setLoading] = useState(false)
+  useEffect(() => {
+    if (isDemoMode || !complaint.recordId || !complaint.resolutionEvidenceIds?.length) {
+      setImages(isDemoMode ? complaint.resolutionImages ?? [] : [])
+      setLoading(false)
+      return
+    }
+    let active = true
+    let urls: string[] = []
+    setImages([])
+    setLoading(true)
+    void Promise.all(complaint.resolutionEvidenceIds.map(async (id) => {
+      try {
+        return await complaintService.fetchComplaintImage(complaint.recordId!, id, true)
+      } catch (error) {
+        toast.error(getApiErrorMessage(error, `Resolution image ${id} could not be loaded.`))
+        return null
+      }
+    })).then((results) => {
+      urls = results.filter((url): url is string => Boolean(url))
+      if (active) setImages(urls)
+      else urls.forEach((url) => URL.revokeObjectURL(url))
+    }).finally(() => { if (active) setLoading(false) })
+    return () => {
+      active = false
+      urls.forEach((url) => URL.revokeObjectURL(url))
+    }
+  }, [complaint.id, complaint.recordId, complaint.resolutionEvidenceIds, complaint.resolutionImages])
+
+  if (!images.length) {
+    return complaint.resolutionEvidenceIds?.length ? <div className="mt-2 text-xs text-slate-500">{loading ? 'Loading resolution images…' : 'Resolution images are unavailable.'}</div> : null
+  }
+  return <div className="mt-2 flex flex-wrap gap-1">{images.map((image, index) => <a key={`${complaint.id}-resolution-${index}`} href={image} target="_blank" rel="noreferrer"><img src={image} alt={`Resolution evidence ${index + 1} for ${complaint.id}`} className="h-12 w-12 rounded object-cover" /></a>)}</div>
 }
 
 function DuplicateReview() {
   const complaints = useAppStore((state) => state.complaints)
-  const duplicates = complaints.filter((complaint) => complaint.ai.duplicateWarning.toLowerCase().includes('similar'))
-  const [candidateById, setCandidateById] = useState<Record<string, string>>({})
-  const distanceKm = (first: Complaint, second: Complaint) => {
-    const radians = (value: number) => value * Math.PI / 180
-    const dLat = radians(second.latitude - first.latitude)
-    const dLng = radians(second.longitude - first.longitude)
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos(radians(first.latitude)) * Math.cos(radians(second.latitude)) * Math.sin(dLng / 2) ** 2
-    return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+  const [sourceId, setSourceId] = useState('')
+  const [candidateId, setCandidateId] = useState('')
+  const [decision, setDecision] = useState<'linked' | 'separate' | 'manual-review'>('manual-review')
+  const [notes, setNotes] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [recentReviews, setRecentReviews] = useState<{ source: string; candidate: string; decision: string }[]>([])
+  const candidates = complaints.filter((item) => item.id !== sourceId)
+
+  const submitReview = async () => {
+    if (!sourceId || !candidateId) {
+      toast.error('Choose both complaints before recording a review.')
+      return
+    }
+    setBusy(true)
+    try {
+      await complaintService.reviewDuplicate(sourceId, decision, candidateId, notes.trim() || undefined)
+      const source = complaints.find((item) => item.id === sourceId)
+      const candidate = complaints.find((item) => item.id === candidateId)
+      setRecentReviews((items) => [{ source: source?.id ?? sourceId, candidate: candidate?.id ?? candidateId, decision }, ...items])
+      setNotes('')
+      toast.success('Manual duplicate review recorded.')
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Duplicate review could not be saved.'))
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
     <>
-      <SectionHeader eyebrow="Duplicate review" title="Possible duplicate submissions" description="These complaints require manual review to confirm whether they are the same incident or separate cases." />
-      <div className="space-y-4">
-        {duplicates.map((complaint) => {
-          const candidates = complaints
-            .filter((other) => other.id !== complaint.id)
-            .map((other) => ({ complaint: other, distance: distanceKm(complaint, other) }))
-            .sort((a, b) => a.distance - b.distance)
-          const selectedId = candidateById[complaint.id] ?? candidates[0]?.complaint.id ?? ''
-          const selected = candidates.find((candidate) => candidate.complaint.id === selectedId)
-          return (
-          <div key={complaint.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-              <div>
-                <div className="text-xs uppercase tracking-[0.18em] text-slate-400">{complaint.id}</div>
-                <div className="mt-2 text-lg font-bold text-slate-900">{complaint.title}</div>
-                {complaint.duplicateDecision ? <div className="mt-1 text-xs text-slate-500">Decision recorded: {complaint.duplicateDecision}{complaint.duplicateGroupId ? ` · group ${complaint.duplicateGroupId.slice(0, 8)}` : ''}</div> : null}
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <select aria-label={`Potential duplicate for ${complaint.id}`} value={selectedId} onChange={(event) => setCandidateById((current) => ({ ...current, [complaint.id]: event.target.value }))} className="max-w-52 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs">
-                  {candidates.map(({ complaint: other }) => <option key={other.id} value={other.id}>{other.id} · {other.title.slice(0, 28)}</option>)}
-                </select>
-                <button disabled={!selected} onClick={() => {
-                  try { complaintService.reviewDuplicate(complaint.id, 'linked', selectedId); toast.success('Complaints linked into the same review group.') }
-                  catch (error) { toast.error(error instanceof Error ? error.message : 'Could not link the complaints.') }
-                }} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-medium text-slate-700 disabled:opacity-40">Link complaint</button>
-                <button onClick={() => { complaintService.reviewDuplicate(complaint.id, 'separate'); toast.success('Separate-issue decision recorded.') }} className="rounded-xl bg-navy px-3 py-2 text-sm font-medium text-white">Mark separate</button>
-                <button onClick={() => { complaintService.reviewDuplicate(complaint.id, 'manual-review'); toast.success('Forwarded for manual review.') }} className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">Manual review</button>
-              </div>
-            </div>
-            <div className="mt-4 grid gap-4 md:grid-cols-3 text-sm text-slate-600">
-              <div><span className="font-semibold text-slate-900">Similarity:</span> {complaint.ai.confidence}% (simulated)</div>
-              <div><span className="font-semibold text-slate-900">Image risk:</span> {complaint.ai.imageRisk}%</div>
-              <div><span className="font-semibold text-slate-900">Location:</span> {complaint.city}{selected ? ` · ${selected.distance.toFixed(1)} km to ${selected.complaint.id}` : ''}</div>
-            </div>
-          </div>
-          )
-        })}
-        {!duplicates.length ? <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">No potential duplicate signals are present in the demo data.</div> : null}
+      <SectionHeader eyebrow="Duplicate review" title="Manual duplicate review" description="Select two complaints and record an administrator decision. No similarity or fraud score is generated." />
+      <div className="max-w-3xl rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="grid gap-4 md:grid-cols-2">
+          <label className="text-sm font-medium text-slate-700">Complaint
+            <select value={sourceId} onChange={(event) => { setSourceId(event.target.value); setCandidateId('') }} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <option value="">Select complaint</option>
+              {complaints.map((item) => <option key={item.id} value={item.id}>{item.id} · {item.title}</option>)}
+            </select>
+          </label>
+          <label className="text-sm font-medium text-slate-700">Compare with
+            <select value={candidateId} onChange={(event) => setCandidateId(event.target.value)} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <option value="">Select another complaint</option>
+              {candidates.map((item) => <option key={item.id} value={item.id}>{item.id} · {item.title}</option>)}
+            </select>
+          </label>
+          <label className="text-sm font-medium text-slate-700">Decision
+            <select value={decision} onChange={(event) => setDecision(event.target.value as typeof decision)} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <option value="manual-review">Needs further review</option>
+              <option value="linked">Same incident</option>
+              <option value="separate">Separate incidents</option>
+            </select>
+          </label>
+          <label className="text-sm font-medium text-slate-700">Review notes
+            <input maxLength={4000} value={notes} onChange={(event) => setNotes(event.target.value)} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5" />
+          </label>
+        </div>
+        <button disabled={busy || complaints.length < 2} onClick={() => void submitReview()} className="mt-5 rounded-xl bg-navy px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{busy ? 'Saving…' : 'Record review'}</button>
+        {complaints.length < 2 ? <p className="mt-3 text-sm text-slate-500">At least two complaints are required for manual comparison.</p> : null}
       </div>
-    </>
-  )
-}
-
-function SuspiciousReview() {
-  const complaints = useAppStore((state) => state.complaints)
-  const session = useAppStore((state) => state.session)
-  const suspicious = complaints.filter((complaint) => complaint.riskScore > 20)
-
-  return (
-    <>
-      <SectionHeader eyebrow="Suspicious submissions" title="Flagged complaints requiring review" description="Review AI signals with human oversight before final verification and action." />
-      <div className="space-y-4">
-        {suspicious.map((complaint) => (
-          <div key={complaint.id} className="rounded-2xl border border-amber-200 bg-amber-50 p-5 shadow-sm">
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <div>
-                <div className="text-xs uppercase tracking-[0.18em] text-amber-700">{complaint.id}</div>
-                <div className="mt-2 text-lg font-bold text-slate-900">{complaint.title}</div>
-              </div>
-              <div className="flex gap-2">
-                <button onClick={() => { complaintService.addRemark(complaint.id, 'Additional evidence requested by the reviewing officer.'); toast.success('Evidence request added to the complaint timeline.') }} className="rounded-xl border border-amber-200 bg-white px-3 py-2 text-sm font-medium text-amber-700">Request evidence</button>
-                <button onClick={() => { complaintService.updateComplaintStatus(complaint.id, 'Under Review', session?.name); toast.success('Complaint moved to human review.') }} className="rounded-xl bg-amber-500 px-3 py-2 text-sm font-medium text-white">Send for review</button>
-              </div>
-            </div>
-            <div className="mt-4 grid gap-4 md:grid-cols-3 text-sm text-slate-600">
-              <div><span className="font-semibold text-slate-900">Risk score:</span> {complaint.riskScore}</div>
-              <div><span className="font-semibold text-slate-900">AI signal:</span> {complaint.ai.predictedCategory}</div>
-              <div><span className="font-semibold text-slate-900">Officer:</span> {complaint.assignedOfficer}</div>
-            </div>
-          </div>
-        ))}
-      </div>
+      {recentReviews.length ? <div className="mt-5 max-w-3xl space-y-2">{recentReviews.map((review, index) => <div key={`${review.source}-${index}`} className="rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-700">{review.source} ↔ {review.candidate} · {review.decision.replace('-', ' ')}</div>)}</div> : null}
     </>
   )
 }
@@ -1648,7 +1796,7 @@ function OfficerReports() {
   const complaints = useAppStore((state) => state.complaints)
   const session = useAppStore((state) => state.session)
   const assigned = complaints.filter((item) => item.assignedOfficer === session?.name)
-  const data = ['Pending', 'Assigned', 'In Progress', 'Under Review', 'Resolved'].map((status) => ({
+  const data = ['Pending', 'AI Analysis', 'Assigned', 'In Progress', 'Under Review', 'Resolved', 'Closed', 'Escalated'].map((status) => ({
     name: status,
     count: assigned.filter((item) => item.status === status).length,
   }))
@@ -1677,6 +1825,8 @@ function AdminOverview() {
   const complaints = useAppStore((state) => state.complaints)
   const citizens = useAppStore((state) => state.citizens)
   const officers = useAppStore((state) => state.officers)
+  const dashboardStats = useAppStore((state) => state.dashboardStats)
+  const statusCount = (status: string) => dashboardStats?.statuses[status] ?? complaints.filter((item) => item.status === mapStatus(status)).length
   const chartData = Array.from({ length: 6 }, (_, index) => {
     const month = new Date()
     month.setDate(1)
@@ -1690,21 +1840,21 @@ function AdminOverview() {
     }
   })
   const pieData = [
-    { name: 'Pending', value: complaints.filter((item) => item.status === 'Pending').length, color: '#3B82F6' },
-    { name: 'Assigned', value: complaints.filter((item) => item.status === 'Assigned').length, color: '#0EA5E9' },
-    { name: 'In Progress', value: complaints.filter((item) => item.status === 'In Progress').length, color: '#8B5CF6' },
-    { name: 'Under Review', value: complaints.filter((item) => item.status === 'Under Review').length, color: '#F59E0B' },
-    { name: 'Resolved', value: complaints.filter((item) => item.status === 'Resolved').length, color: '#10B981' },
-    { name: 'Escalated', value: complaints.filter((item) => item.status === 'Escalated').length, color: '#EF4444' },
+    { name: 'Submitted', value: statusCount('SUBMITTED'), color: '#3B82F6' },
+    { name: 'Assigned', value: statusCount('ASSIGNED'), color: '#0EA5E9' },
+    { name: 'In Progress', value: statusCount('IN_PROGRESS'), color: '#8B5CF6' },
+    { name: 'Under review', value: statusCount('UNDER_INVESTIGATION'), color: '#F59E0B' },
+    { name: 'Resolved', value: statusCount('RESOLVED'), color: '#10B981' },
+    { name: 'Escalated', value: statusCount('ESCALATED'), color: '#EF4444' },
   ]
 
   const stats = [
-    { label: 'Total complaints', value: String(complaints.length), note: 'Across all districts', icon: FileText, tone: 'blue' },
-    { label: 'Citizens', value: String(citizens.length), note: 'Registered users', icon: Users, tone: 'violet' },
-    { label: 'Officers', value: String(officers.filter((item) => item.active).length), note: 'Available staff', icon: ShieldCheck, tone: 'green' },
-    { label: 'Pending', value: String(complaints.filter((item) => item.status === 'Pending').length), note: 'Awaiting review', icon: Gauge, tone: 'amber' },
-    { label: 'Resolved', value: String(complaints.filter((item) => item.status === 'Resolved').length), note: 'Closed cases', icon: CheckCircle2, tone: 'green' },
-    { label: 'Suspicious', value: String(complaints.filter((item) => item.riskScore > 20).length), note: 'Needs human review', icon: AlertTriangle, tone: 'amber' },
+    { label: 'Total complaints', value: String(dashboardStats?.complaints ?? complaints.length), note: 'Across all districts', icon: FileText, tone: 'blue' },
+    { label: 'Citizens', value: String(dashboardStats?.citizens ?? citizens.length), note: 'Registered users', icon: Users, tone: 'violet' },
+    { label: 'Officers', value: String(dashboardStats?.officers ?? officers.filter((item) => item.active).length), note: 'Active staff', icon: ShieldCheck, tone: 'green' },
+    { label: 'Awaiting review', value: String(statusCount('SUBMITTED')), note: 'Submitted complaints', icon: Gauge, tone: 'amber' },
+    { label: 'Resolved', value: String(statusCount('RESOLVED') + statusCount('CLOSED')), note: 'Resolved or closed cases', icon: CheckCircle2, tone: 'green' },
+    { label: 'Under investigation', value: String(statusCount('UNDER_INVESTIGATION')), note: 'Current review status', icon: AlertTriangle, tone: 'amber' },
   ]
 
   return (
@@ -1745,25 +1895,21 @@ function AdminOverview() {
 }
 
 function AdminMonitoring() {
+  const complaints = useAppStore((state) => state.complaints)
+  const analysisStatuses = ['NOT_CONFIGURED', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED']
+  const statusCounts = analysisStatuses.map((status) => ({
+    status,
+    count: complaints.filter((complaint) => complaint.aiStatus === status).length,
+  }))
   return (
     <>
-      <SectionHeader eyebrow="AI monitoring" title="AI monitoring" description="Review model performance, duplicate detection and suspicious-content classification." />
-      <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">All model metrics and outputs shown here are simulated demonstration data, not production AI analysis.</p>
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {[
-          ['Image classification', '98%', 'Operational', 'blue'],
-          ['Duplicate detection', '94%', 'Operational', 'violet'],
-          ['Image forensics', '89%', 'Needs review', 'amber'],
-          ['Department routing', '99%', 'Operational', 'green'],
-        ].map(([label, value, status, tone]) => (
-          <div key={label} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-            <div className="mb-3 flex items-center justify-between">
-              <div className="text-sm font-semibold text-slate-800">{label}</div>
-              <Pill className={tone === 'green' ? 'bg-emerald-100 text-emerald-700' : tone === 'amber' ? 'bg-amber-100 text-amber-700' : 'bg-sky-100 text-blue-700'}>{status}</Pill>
-            </div>
-            <div className="text-3xl font-black tracking-[-0.05em] text-slate-900">{value}</div>
-          </div>
-        ))}
+      <SectionHeader eyebrow="AI monitoring" title="Analysis job status" description="Real job states returned for complaints. No model accuracy or risk scores are reported." />
+      <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">The service reports NOT_CONFIGURED until an AI provider and worker are enabled. Complaint handling remains available without AI analysis.</p>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+        {statusCounts.map(({ status, count }) => <div key={status} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">{status.replace('_', ' ')}</div>
+          <div className="mt-3 text-3xl font-black tracking-[-0.05em] text-slate-900">{count}</div>
+        </div>)}
       </div>
     </>
   )
@@ -1775,6 +1921,7 @@ function AdminAllComplaints() {
   const officers = useAppStore((state) => state.officers)
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState('All')
+  const [departmentDrafts, setDepartmentDrafts] = useState<Record<string, string>>({})
   const [sortOrder, setSortOrder] = useState<'newest' | 'oldest'>('newest')
   const [page, setPage] = useState(1)
   const filtered = complaints.filter((complaint) => {
@@ -1796,7 +1943,7 @@ function AdminAllComplaints() {
             <input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1) }} placeholder="Search ID, title, citizen or department" className="w-full bg-transparent text-sm outline-none" />
           </label>
           <select value={status} onChange={(event) => { setStatus(event.target.value); setPage(1) }} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm">
-            {['All', 'Pending', 'Assigned', 'In Progress', 'Under Review', 'Resolved', 'Escalated'].map((item) => <option key={item}>{item}</option>)}
+            {['All', 'Pending', 'AI Analysis', 'Assigned', 'In Progress', 'Under Review', 'Resolved', 'Closed', 'Escalated'].map((item) => <option key={item}>{item}</option>)}
           </select>
           <select aria-label="Sort complaints by date" value={sortOrder} onChange={(event) => setSortOrder(event.target.value as 'newest' | 'oldest')} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm"><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select>
         </div>
@@ -1821,30 +1968,38 @@ function AdminAllComplaints() {
                   </td>
                   <td className="py-3 pr-4 text-slate-700">{complaint.citizenName}</td>
                   <td className="py-3 pr-4">
-                    <select aria-label={`Assign department for ${complaint.id}`} value={complaint.department} onChange={(event) => {
-                      complaintService.assignComplaint(complaint.id, event.target.value)
-                      toast.success('Complaint routing updated.')
+                    <select aria-label={`Select department for ${complaint.id}`} value={departmentDrafts[complaint.id] ?? complaint.department} onChange={(event) => {
+                      setDepartmentDrafts((current) => ({ ...current, [complaint.id]: event.target.value }))
                     }} className="max-w-40 rounded-xl border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs">
                       {departments.map((item) => <option key={item.id}>{item.name}</option>)}
                     </select>
                   </td>
                   <td className="py-3 pr-4">
-                    <select aria-label={`Assign officer for ${complaint.id}`} value={complaint.assignedOfficer} onChange={(event) => {
-                      complaintService.assignComplaint(complaint.id, complaint.department, event.target.value)
-                      toast.success('Officer assignment updated.')
+                    <select aria-label={`Assign officer for ${complaint.id}`} value={officers.find((item) => item.name === complaint.assignedOfficer)?.id ?? ''} onChange={(event) => {
+                      const officer = officers.find((item) => item.id === event.target.value)
+                      if (!officer) return
+                      const department = departmentDrafts[complaint.id] ?? complaint.department
+                      void complaintService.assignComplaint(complaint.id, department, officer.name).then(
+                        () => {
+                          setDepartmentDrafts((current) => { const next = { ...current }; delete next[complaint.id]; return next })
+                          toast.success('Complaint assignment updated.')
+                        },
+                        (error: unknown) => toast.error(getApiErrorMessage(error, 'Complaint could not be assigned.')),
+                      )
                     }} className="max-w-40 rounded-xl border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs">
-                      <option value="Unassigned">Unassigned</option>
-                      {officers.filter((item) => item.active && item.department === complaint.department).map((item) => <option key={item.id}>{item.name}</option>)}
-                      {!officers.some((item) => item.name === complaint.assignedOfficer) && complaint.assignedOfficer !== 'Unassigned' ? <option>{complaint.assignedOfficer}</option> : null}
+                      <option value="">Select officer</option>
+                      {officers.filter((item) => item.active && item.department === (departmentDrafts[complaint.id] ?? complaint.department)).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
                     </select>
                   </td>
                   <td className="py-3 pr-4"><StatusBadge status={complaint.status} /></td>
                   <td className="py-3">
                     <select aria-label={`Update status for ${complaint.id}`} value={complaint.status} onChange={(event) => {
-                      complaintService.updateComplaintStatus(complaint.id, event.target.value as ComplaintStatus)
-                      toast.success(`Updated ${complaint.id}.`)
+                      void complaintService.updateComplaintStatus(complaint.id, event.target.value as ComplaintStatus).then(
+                        () => toast.success(`Updated ${complaint.id}.`),
+                        (error: unknown) => toast.error(getApiErrorMessage(error, 'Status could not be updated.')),
+                      )
                     }} className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs">
-                      {['Pending', 'Assigned', 'In Progress', 'Under Review', 'Resolved', 'Escalated'].map((item) => <option key={item}>{item}</option>)}
+                      {[complaint.status, ...getAvailableStatuses(complaint.status)].map((item) => <option key={item}>{item}</option>)}
                     </select>
                   </td>
                 </tr>
@@ -1866,34 +2021,9 @@ function AdminAllComplaints() {
   )
 }
 
-function FraudReview() {
-  const complaints = useAppStore((state) => state.complaints)
-  const flagged = complaints.filter((complaint) => complaint.riskScore > 20 || complaint.ai.imageRisk > 40)
-  return (
-    <>
-      <SectionHeader eyebrow="Fraud review queue" title="Fraud and risk review" description="View suspicious uploads, risk indicators and verification outcomes before final action." />
-      <div className="space-y-4">
-        {flagged.map((complaint) => <div key={complaint.id} className="rounded-2xl border border-amber-200 bg-amber-50 p-5 shadow-sm">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div><div className="text-xs font-bold uppercase tracking-wider text-amber-700">{complaint.id} · risk {complaint.riskScore}/100</div><h2 className="mt-2 font-bold text-slate-900">{complaint.title}</h2><p className="mt-1 text-sm text-slate-600">{complaint.ai.duplicateWarning}</p></div>
-            <div className="flex gap-2">
-              <button onClick={() => { complaintService.addRemark(complaint.id, 'Senior review requested for flagged submission.'); toast.success('Forwarded for manual investigation.') }} className="rounded-xl border border-amber-300 bg-white px-3 py-2 text-sm font-medium text-amber-800">Forward for investigation</button>
-              <button onClick={() => { complaintService.addRemark(complaint.id, 'Risk review completed; complaint verified by administrator.'); toast.success('Verification decision recorded.') }} className="rounded-xl bg-amber-600 px-3 py-2 text-sm font-medium text-white">Verify</button>
-            </div>
-          </div>
-          {complaint.images.length ? <div className="mt-4 flex gap-3">{complaint.images.map((image, index) => <img key={`${complaint.id}-${index}`} src={image} alt={`Evidence for ${complaint.id}`} className="h-20 w-20 rounded-lg object-cover" />)}</div> : null}
-          <p className="mt-3 text-xs text-slate-500">Automated signals are simulated and never automatically reject a complaint.</p>
-        </div>)}
-        {!flagged.length ? <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">No complaints are currently flagged for review.</div> : null}
-      </div>
-    </>
-  )
-}
-
 function CitizenManagement() {
   const citizens = useAppStore((state) => state.citizens)
   const complaints = useAppStore((state) => state.complaints)
-  const setCitizenActive = useAppStore((state) => state.setCitizenActive)
   const [query, setQuery] = useState('')
   const [selectedId, setSelectedId] = useState('')
   const filtered = citizens.filter((citizen) => `${citizen.name} ${citizen.email} ${citizen.district}`.toLowerCase().includes(query.toLowerCase()))
@@ -1922,7 +2052,7 @@ function CitizenManagement() {
                 <td className="py-3 pr-4 text-slate-700">{citizen.email}</td>
                 <td className="py-3 pr-4 text-slate-700">{citizen.district}</td>
                 <td className="py-3 pr-4"><StatusBadge status={citizen.active ? 'Active' : 'Inactive'} /></td>
-                <td className="py-3 pr-4"><div className="flex gap-2"><button onClick={() => setSelectedId(selectedId === citizen.id ? '' : citizen.id)} className="text-xs font-semibold text-blue-600">Details</button><button onClick={() => { setCitizenActive(citizen.id, !citizen.active); toast.success(`Citizen account ${citizen.active ? 'deactivated' : 'activated'}.`) }} className="text-xs font-semibold text-slate-600">{citizen.active ? 'Deactivate' : 'Activate'}</button></div></td>
+                <td className="py-3 pr-4"><div className="flex gap-2"><button onClick={() => setSelectedId(selectedId === citizen.id ? '' : citizen.id)} className="text-xs font-semibold text-blue-600">Details</button><button onClick={() => { void adminService.setCitizenActive(citizen.id, !citizen.active).then(() => toast.success(`Citizen account ${citizen.active ? 'deactivated' : 'activated'}.`), (error: unknown) => toast.error(getApiErrorMessage(error, 'Citizen status could not be updated.'))) }} className="text-xs font-semibold text-slate-600">{citizen.active ? 'Deactivate' : 'Activate'}</button></div></td>
               </tr>
               {selectedId === citizen.id ? <tr><td colSpan={5} className="bg-slate-50 p-4">
                 <div className="text-sm font-semibold text-slate-800">{citizen.phone || 'No phone provided'} · {citizen.city}, {citizen.state}</div>
@@ -1942,18 +2072,21 @@ function CitizenManagement() {
 function OfficerManagement() {
   const officers = useAppStore((state) => state.officers)
   const departments = useAppStore((state) => state.departments)
-  const setOfficerActive = useAppStore((state) => state.setOfficerActive)
   const [editingId, setEditingId] = useState('')
-  const [form, setForm] = useState({ name: '', email: '', department: departments[0]?.name ?? '', jurisdiction: '', workload: 0 })
-  const submit = (event: React.FormEvent<HTMLFormElement>) => {
+  const [form, setForm] = useState({ name: '', email: '', department: departments[0]?.name ?? '', jurisdiction: '', workload: 0, password: '' })
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!form.name.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email) || !form.jurisdiction.trim()) {
       toast.error('Enter a name, valid email and jurisdiction.')
       return
     }
+    if (!editingId && !isDemoMode && form.password.length < 12) {
+      toast.error('Set an initial password of at least 12 characters.')
+      return
+    }
     try {
-      officerService.saveOfficer({ ...form, active: officers.find((item) => item.id === editingId)?.active ?? true, id: editingId || undefined })
-      setForm({ name: '', email: '', department: departments[0]?.name ?? '', jurisdiction: '', workload: 0 })
+      await officerService.saveOfficer({ ...form, active: officers.find((item) => item.id === editingId)?.active ?? true, id: editingId || undefined })
+      setForm({ name: '', email: '', department: departments[0]?.name ?? '', jurisdiction: '', workload: 0, password: '' })
       setEditingId('')
       toast.success(editingId ? 'Officer updated.' : 'Officer created.')
     } catch (error) {
@@ -1964,11 +2097,12 @@ function OfficerManagement() {
     <>
       <SectionHeader eyebrow="Officers" title="Officer management" description="Manage officer assignments, workloads and department jurisdiction visibility." />
       <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-        <form onSubmit={submit} className="mb-6 grid gap-3 rounded-xl bg-slate-50 p-4 md:grid-cols-2 xl:grid-cols-5">
+        <form onSubmit={(event) => void submit(event)} className="mb-6 grid gap-3 rounded-xl bg-slate-50 p-4 md:grid-cols-2 xl:grid-cols-5">
           <input required value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} placeholder="Officer name" className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm" />
           <input required type="email" value={form.email} onChange={(event) => setForm((current) => ({ ...current, email: event.target.value }))} placeholder="Email" className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm" />
           <select value={form.department} onChange={(event) => setForm((current) => ({ ...current, department: event.target.value }))} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">{departments.map((item) => <option key={item.id}>{item.name}</option>)}</select>
           <input required value={form.jurisdiction} onChange={(event) => setForm((current) => ({ ...current, jurisdiction: event.target.value }))} placeholder="Jurisdiction" className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm" />
+          {!editingId ? <input required={!isDemoMode} minLength={isDemoMode ? 8 : 12} type="password" value={form.password} onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))} placeholder="Initial password" className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm" /> : null}
           <button type="submit" className="rounded-lg bg-navy px-3 py-2 text-sm font-semibold text-white">{editingId ? 'Save officer' : 'Create officer'}</button>
         </form>
         <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-200 text-left text-sm">
@@ -1988,7 +2122,7 @@ function OfficerManagement() {
                 <td className="py-3 pr-4 text-slate-700">{officer.department}</td>
                 <td className="py-3 pr-4 text-slate-700">{officer.jurisdiction}</td>
                 <td className="py-3 pr-4 text-slate-700">{officer.workload} cases</td>
-                <td className="py-3"><div className="flex gap-3"><button onClick={() => { setEditingId(officer.id); setForm({ name: officer.name, email: officer.email, department: officer.department, jurisdiction: officer.jurisdiction, workload: officer.workload }) }} className="text-xs font-semibold text-blue-600">Edit</button><button onClick={() => { setOfficerActive(officer.id, !officer.active); toast.success(`Officer ${officer.active ? 'deactivated' : 'activated'}.`) }} className="text-xs font-semibold text-slate-600">{officer.active ? 'Deactivate' : 'Activate'}</button></div></td>
+                <td className="py-3"><div className="flex gap-3"><button onClick={() => { setEditingId(officer.id); setForm({ name: officer.name, email: officer.email, department: officer.department, jurisdiction: officer.jurisdiction, workload: officer.workload, password: '' }) }} className="text-xs font-semibold text-blue-600">Edit</button><button onClick={() => { void officerService.setOfficerActive(officer.id, !officer.active).then(() => toast.success(`Officer ${officer.active ? 'deactivated' : 'activated'}.`), (error: unknown) => toast.error(getApiErrorMessage(error, 'Officer status could not be updated.'))) }} className="text-xs font-semibold text-slate-600">{officer.active ? 'Deactivate' : 'Activate'}</button></div></td>
               </tr>
             ))}
           </tbody>
@@ -2003,7 +2137,7 @@ function DepartmentManagement() {
   const complaints = useAppStore((state) => state.complaints)
   const [editingId, setEditingId] = useState('')
   const [form, setForm] = useState({ name: '', code: '', location: '' })
-  const submit = (event: React.FormEvent<HTMLFormElement>) => {
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!form.name.trim() || !form.code.trim() || !form.location.trim()) {
       toast.error('Complete the department name, code and jurisdiction.')
@@ -2016,8 +2150,8 @@ function DepartmentManagement() {
         ...form,
         id: editingId || undefined,
       }
-      if (current) departmentService.updateDepartment({ ...department, id: current.id })
-      else departmentService.createDepartment(department)
+      if (current) await departmentService.updateDepartment({ ...department, id: current.id })
+      else await departmentService.createDepartment(department)
       setEditingId('')
       setForm({ name: '', code: '', location: '' })
       toast.success(current ? 'Department updated.' : 'Department created.')
@@ -2028,7 +2162,7 @@ function DepartmentManagement() {
   return (
     <>
       <SectionHeader eyebrow="Departments" title="Department management" description="Review department health, response rates and complaint load." />
-      <form onSubmit={submit} className="mb-6 grid gap-3 rounded-xl border border-slate-200 bg-white p-4 md:grid-cols-4">
+      <form onSubmit={(event) => void submit(event)} className="mb-6 grid gap-3 rounded-xl border border-slate-200 bg-white p-4 md:grid-cols-4">
         <input required value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} placeholder="Department name" className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm" />
         <input required value={form.code} onChange={(event) => setForm((current) => ({ ...current, code: event.target.value.toUpperCase() }))} placeholder="Department code" className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm" />
         <input required value={form.location} onChange={(event) => setForm((current) => ({ ...current, location: event.target.value }))} placeholder="Jurisdiction" className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm" />
@@ -2038,7 +2172,7 @@ function DepartmentManagement() {
         {departments.map((department) => {
           const departmentComplaints = complaints.filter((complaint) => complaint.department === department.name)
           const resolutionRate = departmentComplaints.length
-            ? Math.round(departmentComplaints.filter((complaint) => complaint.status === 'Resolved').length / departmentComplaints.length * 100)
+            ? Math.round(departmentComplaints.filter((complaint) => complaint.status === 'Resolved' || complaint.status === 'Closed').length / departmentComplaints.length * 100)
             : 0
           return (
           <div key={department.id} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -2055,10 +2189,10 @@ function DepartmentManagement() {
             <div className="mt-2 text-xs text-slate-500">{departmentComplaints.length} complaint records</div>
             <div className="mt-4 flex flex-wrap gap-3 text-xs font-semibold">
               <button onClick={() => { setEditingId(department.id); setForm({ name: department.name, code: department.code, location: department.location }) }} className="text-blue-600">Edit</button>
-              <button onClick={() => { departmentService.updateDepartment({ ...department, active: !department.active }); toast.success(`Department ${department.active ? 'deactivated' : 'activated'}.`) }} className="text-slate-600">{department.active ? 'Deactivate' : 'Activate'}</button>
+              <button onClick={() => { void departmentService.updateDepartment({ ...department, active: !department.active }).then(() => toast.success(`Department ${department.active ? 'deactivated' : 'activated'}.`), (error: unknown) => toast.error(getApiErrorMessage(error, 'Department status could not be updated.'))) }} className="text-slate-600">{department.active ? 'Deactivate' : 'Activate'}</button>
               <button onClick={() => {
                 if (!window.confirm(`Delete ${department.name}?`)) return
-                try { departmentService.deleteDepartment(department.id); toast.success('Department deleted.') } catch (error) { toast.error(error instanceof Error ? error.message : 'Department could not be deleted.') }
+                void departmentService.deleteDepartment(department.id).then(() => toast.success('Department deleted.'), (error: unknown) => toast.error(getApiErrorMessage(error, 'Department could not be deleted.')))
               }} className="text-red-600">Delete</button>
             </div>
           </div>
@@ -2074,14 +2208,14 @@ function CategoryManagement() {
   const departments = useAppStore((state) => state.departments)
   const [editingId, setEditingId] = useState('')
   const [form, setForm] = useState({ name: '', department: departments[0]?.name ?? '', defaultPriority: 'Medium' as Complaint['priority'], slaHours: 72 })
-  const submit = (event: React.FormEvent<HTMLFormElement>) => {
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!form.name.trim() || !form.department || !Number.isFinite(form.slaHours) || form.slaHours < 1) {
       toast.error('Enter a category, department and positive SLA target.')
       return
     }
     try {
-      categoryService.saveCategory({ ...form, active: true, id: editingId || undefined })
+      await categoryService.saveCategory({ ...form, active: true, id: editingId || undefined })
       setEditingId('')
       setForm({ name: '', department: departments[0]?.name ?? '', defaultPriority: 'Medium', slaHours: 72 })
       toast.success('Category saved.')
@@ -2092,7 +2226,7 @@ function CategoryManagement() {
   return (
     <>
       <SectionHeader eyebrow="Categories" title="Category management" description="Configure complaint routing, default priority and response targets." />
-      <form onSubmit={submit} className="mb-6 grid gap-3 rounded-xl border border-slate-200 bg-white p-4 md:grid-cols-2 xl:grid-cols-5">
+      <form onSubmit={(event) => void submit(event)} className="mb-6 grid gap-3 rounded-xl border border-slate-200 bg-white p-4 md:grid-cols-2 xl:grid-cols-5">
         <input required value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} placeholder="Category name" className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm" />
         <select value={form.department} onChange={(event) => setForm((current) => ({ ...current, department: event.target.value }))} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm">{departments.map((item) => <option key={item.id}>{item.name}</option>)}</select>
         <select value={form.defaultPriority} onChange={(event) => setForm((current) => ({ ...current, defaultPriority: event.target.value as Complaint['priority'] }))} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm">{['Low', 'Medium', 'High', 'Critical'].map((item) => <option key={item}>{item}</option>)}</select>
@@ -2107,7 +2241,7 @@ function CategoryManagement() {
               <td className="py-3 pr-4 font-semibold text-slate-800">{category.name}</td><td className="py-3 pr-4 text-slate-600">{category.department}</td><td className="py-3 pr-4"><StatusBadge status={category.defaultPriority} /></td><td className="py-3 pr-4">{category.slaHours} hours</td>
               <td className="py-3"><div className="flex gap-3"><button onClick={() => { setEditingId(category.id); setForm({ name: category.name, department: category.department, defaultPriority: category.defaultPriority, slaHours: category.slaHours }) }} className="text-xs font-semibold text-blue-600">Edit</button><button onClick={() => {
                 if (!window.confirm(`Delete category ${category.name}?`)) return
-                try { categoryService.deleteCategory(category.id); toast.success('Category deleted.') } catch (error) { toast.error(error instanceof Error ? error.message : 'Category could not be deleted.') }
+                void categoryService.deleteCategory(category.id).then(() => toast.success('Category deleted.'), (error: unknown) => toast.error(getApiErrorMessage(error, 'Category could not be deleted.')))
               }} className="text-xs font-semibold text-red-600">Delete</button></div></td>
             </tr>)}
           </tbody>
@@ -2122,9 +2256,10 @@ function SlaManagement() {
   const complaints = useAppStore((state) => state.complaints)
   const departments = useAppStore((state) => state.departments)
   const prioritySlaHours = useAppStore((state) => state.prioritySlaHours)
-  const setPrioritySla = useAppStore((state) => state.setPrioritySla)
+  const [priorityDraft, setPriorityDraft] = useState(prioritySlaHours)
+  useEffect(() => setPriorityDraft(prioritySlaHours), [prioritySlaHours])
   const [departmentFilter, setDepartmentFilter] = useState('All')
-  const openComplaints = complaints.filter((complaint) => complaint.status !== 'Resolved')
+  const openComplaints = complaints.filter((complaint) => complaint.status !== 'Resolved' && complaint.status !== 'Closed')
   const now = Date.now()
   const deadlines = openComplaints.map((complaint) => {
     const category = categories.find((item) => item.name === complaint.category)
@@ -2142,7 +2277,7 @@ function SlaManagement() {
             <input type="number" min={1} defaultValue={category.slaHours} onBlur={(event) => {
               const hours = Number(event.target.value)
               if (!Number.isFinite(hours) || hours < 1) { toast.error('SLA must be at least one hour.'); event.target.value = String(category.slaHours); return }
-              if (hours !== category.slaHours) { categoryService.saveCategory({ ...category, slaHours: hours }); toast.success('SLA target updated.') }
+              if (hours !== category.slaHours) { void categoryService.saveCategory({ ...category, slaHours: hours }).then(() => toast.success('SLA target updated.'), (error: unknown) => toast.error(getApiErrorMessage(error, 'SLA target could not be saved.'))) }
             }} className="mt-1 block w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm" />
           </label>
           <div className="mt-2 text-xs text-slate-500">Routed to {category.department}</div>
@@ -2152,10 +2287,16 @@ function SlaManagement() {
         {(['Critical', 'High', 'Medium', 'Low'] as const).map((priority) => <label key={priority} className="rounded-2xl border border-slate-200 bg-white p-4 text-sm font-semibold text-slate-800">
           {priority} priority target
           <div className="mt-2 flex items-center gap-2 font-normal text-slate-500">
-            <input type="number" min={1} value={prioritySlaHours[priority]} onChange={(event) => {
+            <input type="number" min={1} value={priorityDraft[priority]} onChange={(event) => {
               const hours = Number(event.target.value)
-              if (!Number.isFinite(hours) || hours < 1) return
-              try { setPrioritySla(priority, hours) } catch (error) { toast.error(error instanceof Error ? error.message : 'SLA could not be saved.') }
+              setPriorityDraft((current) => ({ ...current, [priority]: hours }))
+            }} onBlur={() => {
+              const hours = priorityDraft[priority]
+              if (!Number.isFinite(hours) || hours < 1) { setPriorityDraft(prioritySlaHours); toast.error('SLA must be at least one hour.'); return }
+              if (hours !== prioritySlaHours[priority]) void adminService.setPrioritySla(priority, hours).then(
+                () => toast.success(`${priority} SLA target updated.`),
+                (error: unknown) => toast.error(getApiErrorMessage(error, 'SLA could not be saved.')),
+              )
             }} className="w-24 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm" />
             hours
           </div>
@@ -2191,13 +2332,21 @@ function AdminReports() {
     return {
       name: department.name,
       total: items.length,
-      resolved: items.filter((complaint) => complaint.status === 'Resolved').length,
-      resolutionRate: items.length ? Math.round(items.filter((complaint) => complaint.status === 'Resolved').length / items.length * 100) : 0,
+      resolved: items.filter((complaint) => complaint.status === 'Resolved' || complaint.status === 'Closed').length,
+      resolutionRate: items.length ? Math.round(items.filter((complaint) => complaint.status === 'Resolved' || complaint.status === 'Closed').length / items.length * 100) : 0,
     }
   })
+  const exportReport = async () => {
+    try {
+      const blob = await adminService.exportReport(from || undefined, to || undefined)
+      downloadBlob(blob, 'grievance-report.csv')
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Report could not be exported.'))
+    }
+  }
   return (
     <>
-      <SectionHeader eyebrow="Analytics" title="Analytics and reports" description="Derived department performance for the selected complaint date range." action={<button onClick={() => downloadCsv('grievance-report.csv', data)} className="rounded-xl bg-navy px-4 py-2.5 text-sm font-semibold text-white">Export CSV</button>} />
+      <SectionHeader eyebrow="Analytics" title="Analytics and reports" description="Derived from service complaint records for the selected date range." action={<button onClick={() => void exportReport()} className="rounded-xl bg-navy px-4 py-2.5 text-sm font-semibold text-white">Export CSV</button>} />
       <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
         <div className="mb-5 flex flex-wrap items-end gap-3">
           <label className="text-xs font-semibold text-slate-600">From<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} className="mt-1 block rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm" /></label>
@@ -2233,7 +2382,7 @@ function AuditLogs() {
 
   return (
     <>
-      <SectionHeader eyebrow="Audit trail" title="Audit logs" description="Demonstration record of actions taken by officers and administrators." />
+      <SectionHeader eyebrow="Audit trail" title="Audit logs" description="Review recorded actions from the grievance service." />
       <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
         <label className="mb-4 flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
           <Search size={16} className="text-slate-400" />
@@ -2241,41 +2390,21 @@ function AuditLogs() {
         </label>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
-            <thead><tr className="text-[11px] uppercase tracking-[0.18em] text-slate-400"><th className="pb-3 pr-4">User</th><th className="pb-3 pr-4">Role</th><th className="pb-3 pr-4">Action</th><th className="pb-3 pr-4">Related complaint</th><th className="pb-3 pr-4">Demo IP</th><th className="pb-3">Timestamp</th></tr></thead>
+            <thead><tr className="text-[11px] uppercase tracking-[0.18em] text-slate-400"><th className="pb-3 pr-4">User</th><th className="pb-3 pr-4">Role</th><th className="pb-3 pr-4">Action</th><th className="pb-3 pr-4">Related complaint</th>            <th className="pb-3 pr-4">Request IP</th><th className="pb-3">Timestamp</th></tr></thead>
             <tbody className="divide-y divide-slate-100">
               {filtered.map((event) => <tr key={event.id}>
                 <td className="py-3 pr-4 font-medium text-slate-800">{event.actor}</td>
                 <td className="py-3 pr-4 capitalize text-slate-600">{event.role}</td>
                 <td className="py-3 pr-4 text-slate-600">{event.action}</td>
                 <td className="py-3 pr-4 text-slate-600">{event.relatedComplaintId ?? '—'}</td>
-                <td className="py-3 pr-4 text-slate-600">{event.ipAddress ?? 'Demo IP unavailable'}</td>
+                <td className="py-3 pr-4 text-slate-600">{event.ipAddress}</td>
                 <td className="py-3 text-slate-600">{new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(event.createdAt))}</td>
               </tr>)}
               {!filtered.length ? <tr><td colSpan={6} className="py-8 text-center text-slate-500">No audit activity found.</td></tr> : null}
             </tbody>
           </table>
         </div>
-        <p className="mt-4 text-xs text-slate-400">The displayed IP is reserved demonstration data, not a captured client address. Audit records are local demo data only.</p>
-      </div>
-    </>
-  )
-}
-
-function AdminSettings() {
-  const navigate = useNavigate()
-  const reset = () => {
-    if (!window.confirm('Reset all local demo data to the original sample records? This cannot be undone.')) return
-    adminService.resetDemoData()
-    toast.success('Demo data reset.')
-    navigate('/login', { replace: true })
-  }
-  return (
-    <>
-      <SectionHeader eyebrow="Settings" title="Demo settings" description="Manage local demonstration data. These settings do not affect a production service." />
-      <div className="max-w-2xl rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-        <h2 className="font-bold text-slate-900">Reset demonstration data</h2>
-        <p className="mt-2 text-sm leading-6 text-slate-600">Reset complaints, notifications, profiles, departments, officers and audit events stored in this browser.</p>
-        <button onClick={reset} className="mt-5 rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-semibold text-red-700">Reset demo data</button>
+        <p className="mt-4 text-xs text-slate-400">Audit records are returned by the service. An IP address is shown only when the service recorded one.</p>
       </div>
     </>
   )
@@ -2284,11 +2413,11 @@ function AdminSettings() {
 function HelpSupport() {
   return (
     <>
-      <SectionHeader eyebrow="Support" title="Help & support" description="Guidance for using this grievance portal demonstration." />
+      <SectionHeader eyebrow="Support" title="Help & support" description="Guidance for using the grievance portal." />
       <div className="max-w-3xl space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm text-sm leading-7 text-slate-600">
         <p>Submit a complaint with its location and supporting details. Your reference ID can be used on the Track Complaint page to review status updates.</p>
-        <p>For this prototype, records are stored in this browser only. Do not submit sensitive personal information or rely on simulated AI review as a government decision.</p>
-        <a className="font-semibold text-blue-600" href="mailto:support@example.com">Contact demonstration support</a>
+        <p>Complaint records and account data are managed by the connected grievance service. Automated analysis is unavailable unless a provider is configured; decisions remain with authorized staff.</p>
+        <p>Support contact details have not been configured for this service.</p>
       </div>
     </>
   )

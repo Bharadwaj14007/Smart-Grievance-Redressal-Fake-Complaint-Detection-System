@@ -1,18 +1,20 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
 
 export type Role = 'citizen' | 'officer' | 'admin'
 
 export type ComplaintStatus =
   | 'Pending'
+  | 'AI Analysis'
   | 'Assigned'
   | 'In Progress'
   | 'Under Review'
   | 'Resolved'
   | 'Escalated'
+  | 'Closed'
 
 export type Complaint = {
   id: string
+  recordId?: string
   title: string
   description: string
   category: string
@@ -35,14 +37,10 @@ export type Complaint = {
   citizenName: string
   citizenEmail: string
   images: string[]
-  riskScore: number
-  ai: {
-    predictedCategory: string
-    suggestedDepartment: string
-    duplicateWarning: string
-    confidence: number
-    imageRisk: number
-  }
+  imageIds?: string[]
+  resolutionEvidenceIds?: string[]
+  feedback?: { rating: number; comment?: string | null; createdAt: string }
+  aiStatus?: string
   createdAt: string
   lastUpdated: string
   statusHistory?: { status: ComplaintStatus; message: string; createdAt: string }[]
@@ -141,6 +139,12 @@ type AppState = {
   citizens: CitizenProfile[]
   auditLogs: AuditEvent[]
   demoAccounts: DemoAccount[]
+  dashboardStats?: {
+    complaints: number
+    citizens: number
+    officers: number
+    statuses: Record<string, number>
+  }
   login: (email: string, password: string) => SessionUser | null
   registerCitizen: (name: string, email: string, password: string) => { user: SessionUser | null; error?: string }
   logout: () => void
@@ -257,14 +261,6 @@ const seedComplaints: Complaint[] = [
     citizenName: 'Aarav Mehta',
     citizenEmail: 'citizen@example.com',
     images: [],
-    riskScore: 24,
-    ai: {
-      predictedCategory: 'Sanitation',
-      suggestedDepartment: 'Municipal Corporation',
-      duplicateWarning: 'Similar complaint found in same vicinity.',
-      confidence: 92,
-      imageRisk: 18,
-    },
     createdAt: '2026-10-29T08:15:00',
     lastUpdated: '2026-10-30T11:10:00',
   },
@@ -292,14 +288,6 @@ const seedComplaints: Complaint[] = [
     citizenName: 'Neha Singh',
     citizenEmail: 'neha@example.com',
     images: [],
-    riskScore: 12,
-    ai: {
-      predictedCategory: 'Street Lighting',
-      suggestedDepartment: 'Electrical Services',
-      duplicateWarning: 'No duplicate signal detected.',
-      confidence: 89,
-      imageRisk: 9,
-    },
     createdAt: '2026-10-25T11:45:00',
     lastUpdated: '2026-10-28T16:30:00',
   },
@@ -327,14 +315,6 @@ const seedComplaints: Complaint[] = [
     citizenName: 'Rohit Kumar',
     citizenEmail: 'rohit@example.com',
     images: [],
-    riskScore: 8,
-    ai: {
-      predictedCategory: 'Waste Management',
-      suggestedDepartment: 'Municipal Corporation',
-      duplicateWarning: 'No duplicate signal detected.',
-      confidence: 94,
-      imageRisk: 5,
-    },
     createdAt: '2026-10-18T09:10:00',
     lastUpdated: '2026-10-21T14:20:00',
   },
@@ -380,10 +360,26 @@ const seedState = {
   demoAccounts: [] as DemoAccount[],
 }
 
+export const isDemoMode = import.meta.env.DEV && import.meta.env.VITE_DEMO_MODE === 'true'
+
+const emptyState = {
+  session: null,
+  complaints: [] as Complaint[],
+  notifications: [] as NotificationItem[],
+  departments: [] as Department[],
+  categories: [] as ComplaintCategory[],
+  prioritySlaHours: { Critical: 12, High: 24, Medium: 72, Low: 120 },
+  officers: [] as Officer[],
+  citizens: [] as CitizenProfile[],
+  auditLogs: [] as AuditEvent[],
+  demoAccounts: [] as DemoAccount[],
+}
+
+const initialState = isDemoMode ? seedState : emptyState
+
 export const useAppStore = create<AppState>()(
-  persist(
     (set, get) => ({
-      ...seedState,
+      ...initialState,
       login: (email: string, password: string) => {
         const normalizedEmail = email.trim().toLowerCase()
         const roleMap: Record<string, Role> = {
@@ -726,7 +722,7 @@ export const useAppStore = create<AppState>()(
             : [...state.categories, { ...category, id }],
           ...(existing && existing.name !== category.name ? {
             complaints: state.complaints.map((item) => item.category === existing.name
-              ? { ...item, category: category.name, ai: { ...item.ai, predictedCategory: category.name } }
+              ? { ...item, category: category.name }
               : item),
           } : {}),
         }))
@@ -761,22 +757,6 @@ export const useAppStore = create<AppState>()(
           }, ...state.auditLogs],
         }))
       },
-      resetDemoData: () => set({ ...seedState }),
+      resetDemoData: () => set({ ...initialState }),
     }),
-    {
-      name: 'nagrik-setu-demo-state',
-      partialize: (state) => ({
-        session: state.session,
-        complaints: state.complaints,
-        notifications: state.notifications,
-        departments: state.departments,
-        categories: state.categories,
-        prioritySlaHours: state.prioritySlaHours,
-        officers: state.officers,
-        citizens: state.citizens,
-        auditLogs: state.auditLogs,
-        demoAccounts: state.demoAccounts,
-      }),
-    },
-  ),
 )

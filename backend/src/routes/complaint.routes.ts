@@ -91,7 +91,7 @@ complaintRouter.get('/:id/images/:imageId', asyncHandler(async (req, res) => {
   await pipeline(object.Body as Readable, res)
 }))
 
-complaintRouter.get('/:id/resolution-evidence/:evidenceId', requireRoles(Role.OFFICER, Role.ADMIN), asyncHandler(async (req, res) => {
+complaintRouter.get('/:id/resolution-evidence/:evidenceId', asyncHandler(async (req, res) => {
   const complaint = await getComplaintForUser(req, req.params.id)
   const evidence = await prisma.resolutionEvidence.findFirst({ where: { id: req.params.evidenceId, complaintId: complaint.id } })
   if (!evidence) throw new HttpError(404, 'Resolution evidence not found.')

@@ -213,8 +213,21 @@ adminRouter.put('/sla/:id', asyncHandler(async (req, res) => {
   res.json({ success: true, data: config })
 }))
 
-adminRouter.get('/reports.csv', asyncHandler(async (_req, res) => {
+adminRouter.get('/reports.csv', asyncHandler(async (req, res) => {
+  const dateQuery = z.object({
+    from: z.string().date().optional(),
+    to: z.string().date().optional(),
+  }).parse(req.query)
+  if (dateQuery.from && dateQuery.to && dateQuery.from > dateQuery.to) {
+    throw new HttpError(400, 'The report start date must be on or before its end date.')
+  }
   const complaints = await prisma.complaint.findMany({
+    where: dateQuery.from || dateQuery.to ? {
+      createdAt: {
+        ...(dateQuery.from ? { gte: new Date(`${dateQuery.from}T00:00:00.000Z`) } : {}),
+        ...(dateQuery.to ? { lte: new Date(`${dateQuery.to}T23:59:59.999Z`) } : {}),
+      },
+    } : undefined,
     select: { trackingId: true, title: true, status: true, severity: true, priority: true, createdAt: true, category: { select: { name: true } }, department: { select: { name: true } } },
     orderBy: { createdAt: 'desc' },
     take: 10000,

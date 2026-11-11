@@ -2,10 +2,12 @@ import type { ComponentType, ReactNode } from 'react'
 
 const statusStyles: Record<string, string> = {
   Pending: 'bg-amber-100 text-amber-700',
+  'AI Analysis': 'bg-sky-100 text-sky-700',
   Assigned: 'bg-blue-100 text-blue-700',
   'In Progress': 'bg-violet-100 text-violet-700',
   'Under Review': 'bg-orange-100 text-orange-700',
   Resolved: 'bg-emerald-100 text-emerald-700',
+  Closed: 'bg-slate-200 text-slate-700',
   Escalated: 'bg-red-100 text-red-700',
   High: 'bg-red-100 text-red-700',
   Medium: 'bg-orange-100 text-orange-700',

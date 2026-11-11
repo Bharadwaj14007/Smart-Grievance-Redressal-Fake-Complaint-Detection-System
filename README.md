@@ -2,14 +2,14 @@
 
 Nagrik Setu is a React/Vite grievance-portal demo with a separate Express/TypeScript API, PostgreSQL data model, private object storage, Redis job queue, and an AI-service integration boundary.
 
-## Run the browser demo
+## Run the portal
 
 ```sh
 npm ci
 npm run dev
 ```
 
-The browser UI remains a localStorage-backed demonstration. It does not currently use the API for its sign-in, complaint, or administration workflows; do not use demo data as operational records.
+The portal uses the API by default. It expects the API at `/api/v1`; set `VITE_API_BASE_URL` when the API is hosted elsewhere. To run the UI without the backend, start Vite with `VITE_DEMO_MODE=true` in the environment. Demo mode is development-only and uses in-memory sample data; authentication and portal data are not persisted in browser storage.
 
 ## Run the local full-stack services
 
