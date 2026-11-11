@@ -28,6 +28,16 @@ export class ComplaintImageUploadError extends Error {
   }
 }
 
+export type DuplicateReviewRecord = {
+  id: string
+  decision: string
+  notes?: string | null
+  createdAt: string
+  complaint: { trackingId: string }
+  candidate: { trackingId: string }
+  reviewer: { email: string }
+}
+
 async function findComplaint(id: string) {
   const cached = useAppStore.getState().complaints.find((item) => item.id === id || item.recordId === id)
   if (cached?.recordId) return cached
@@ -161,6 +171,15 @@ export const complaintService = {
       notes,
     })
     await invalidatePortalData()
+  },
+  getDuplicateReviews: async (id: string): Promise<DuplicateReviewRecord[]> => {
+    if (isDemoMode) return []
+    const complaint = await findComplaint(id)
+    if (!complaint?.recordId) throw new Error('Complaint not found. Refresh the list and try again.')
+    const response = await apiClient.get<ApiEnvelope<{ reviews: DuplicateReviewRecord[] }>>(
+      `/admin/complaints/${complaint.recordId}/duplicates`,
+    )
+    return response.data.data.reviews
   },
   getComplaintTimeline: (id: string) => {
     const complaint = useAppStore.getState().complaints.find((item) => item.id === id)

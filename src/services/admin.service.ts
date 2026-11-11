@@ -27,16 +27,17 @@ export const adminService = {
   },
   setPrioritySla: async (priority: string, hours: number) => {
     if (isDemoMode) return useAppStore.getState().setPrioritySla(priority as 'Low' | 'Medium' | 'High' | 'Critical', hours)
-    const configs = await apiClient.get<{ data: { id: string; priority: string | null }[] }>('/admin/sla')
-    const existing = configs.data.data.find((item) => item.priority?.toLowerCase() === priority.toLowerCase())
-    const id = existing?.id ?? `priority-${priority.toLowerCase()}`
-    await apiClient.put(`/admin/sla/${id}`, {
+    const configs = await apiClient.get<{ data: { id: string; priority: string | null; categoryId: string | null }[] }>('/admin/sla')
+    const existing = configs.data.data.find((item) => !item.categoryId && item.priority?.toLowerCase() === priority.toLowerCase())
+    const body = {
       categoryId: null,
       priority: priority.toUpperCase(),
       responseHours: hours,
       resolutionHours: hours,
       active: true,
-    })
+    }
+    if (existing) await apiClient.put(`/admin/sla/${existing.id}`, body)
+    else await apiClient.post('/admin/sla', body)
     await invalidatePortalData()
   },
   exportReport: async (from?: string, to?: string) => {

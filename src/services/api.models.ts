@@ -63,8 +63,8 @@ export type ApiComplaint = {
     longitude: number
   } | null
   assignments?: { officer?: { email: string; officerProfile?: { fullName: string } | null } }[]
-  images?: { id: string }[]
-  resolutionEvidence?: { id: string }[]
+  images?: { id: string; contentType?: string; sizeBytes?: number; createdAt?: string }[]
+  resolutionEvidence?: { id: string; contentType?: string; sizeBytes?: number; createdAt?: string }[]
   history?: { toStatus: string; note?: string | null; createdAt: string }[]
   notes?: { body: string; createdAt: string; isPublic?: boolean }[]
   aiAnalyses?: { status: string }[]

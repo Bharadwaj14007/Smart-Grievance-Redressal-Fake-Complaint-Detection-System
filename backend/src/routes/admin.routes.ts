@@ -196,7 +196,20 @@ adminRouter.get('/audit-logs', asyncHandler(async (req, res) => {
 adminRouter.get('/sla', asyncHandler(async (_req, res) => {
   res.json({ success: true, data: await prisma.sLAConfiguration.findMany({ include: { category: true } }) })
 }))
+adminRouter.post('/sla', asyncHandler(async (req, res) => {
+  const input = z.object({
+    categoryId: z.string().uuid().nullable().optional(),
+    priority: z.nativeEnum(Priority).nullable().optional(),
+    responseHours: z.number().int().min(1).max(8760),
+    resolutionHours: z.number().int().min(1).max(8760),
+    active: z.boolean().optional(),
+  }).parse(req.body)
+  const config = await prisma.sLAConfiguration.create({ data: input })
+  await writeAudit(req, 'SLA_CONFIGURATION_UPDATED', 'SLAConfiguration', config.id)
+  res.status(201).json({ success: true, data: config })
+}))
 adminRouter.put('/sla/:id', asyncHandler(async (req, res) => {
+  const id = z.string().uuid().parse(req.params.id)
   const input = z.object({
     categoryId: z.string().uuid().nullable().optional(),
     priority: z.nativeEnum(Priority).nullable().optional(),
@@ -205,8 +218,8 @@ adminRouter.put('/sla/:id', asyncHandler(async (req, res) => {
     active: z.boolean().optional(),
   }).parse(req.body)
   const config = await prisma.sLAConfiguration.upsert({
-    where: { id: req.params.id },
-    create: { id: req.params.id, ...input },
+    where: { id },
+    create: { id, ...input },
     update: input,
   })
   await writeAudit(req, 'SLA_CONFIGURATION_UPDATED', 'SLAConfiguration', config.id)

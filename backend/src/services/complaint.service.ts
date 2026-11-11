@@ -124,7 +124,11 @@ export async function getComplaintForUser(req: Request, id: string) {
   const complaint = await prisma.complaint.findUnique({
     where: { id },
     include: {
-      category: true, department: true, location: true, images: true, resolutionEvidence: true,
+      category: true,
+      department: true,
+      location: true,
+      images: { select: { id: true, contentType: true, sizeBytes: true, createdAt: true } },
+      resolutionEvidence: { select: { id: true, contentType: true, sizeBytes: true, createdAt: true } },
       citizen: { select: { email: true, citizenProfile: { select: { fullName: true } } } },
       history: { orderBy: { createdAt: 'asc' } },
       notes: { where: req.user.role !== Role.CITIZEN ? {} : { isPublic: true }, orderBy: { createdAt: 'asc' }, include: { author: { select: { email: true, role: true } } } },

@@ -1,5 +1,5 @@
 import argon2 from 'argon2'
-import { Role } from '@prisma/client'
+import { Priority, Role } from '@prisma/client'
 import { z } from 'zod'
 import { prisma } from '../src/config/prisma.js'
 
@@ -18,6 +18,19 @@ await prisma.complaintCategory.upsert({
   create: { name: 'General Grievance', departmentId: department.id },
   update: { departmentId: department.id },
 })
+for (const [priority, hours] of [
+  [Priority.CRITICAL, 12],
+  [Priority.HIGH, 24],
+  [Priority.MEDIUM, 72],
+  [Priority.LOW, 120],
+] as const) {
+  const existing = await prisma.sLAConfiguration.findFirst({ where: { categoryId: null, priority } })
+  if (!existing) {
+    await prisma.sLAConfiguration.create({
+      data: { categoryId: null, priority, responseHours: hours, resolutionHours: hours, active: true },
+    })
+  }
+}
 const passwordHash = await argon2.hash(seedConfig.SEED_ADMIN_PASSWORD, { type: argon2.argon2id })
 await prisma.user.upsert({
   where: { email: seedConfig.SEED_ADMIN_EMAIL },

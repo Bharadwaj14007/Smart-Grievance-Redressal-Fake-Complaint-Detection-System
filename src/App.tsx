@@ -74,6 +74,7 @@ const navConfig = {
   officer: [
     { label: 'Overview', to: '/officer/overview', icon: LayoutDashboard },
     { label: 'Assigned Complaints', to: '/officer/assigned', icon: ClipboardCheck },
+    { label: 'Notifications', to: '/officer/notifications', icon: Bell },
     { label: 'Reports', to: '/officer/reports', icon: TrendingUp },
     { label: 'Profile', to: '/officer/profile', icon: User },
   ],
@@ -82,6 +83,7 @@ const navConfig = {
     { label: 'All Complaints', to: '/admin/complaints', icon: FileText },
     { label: 'AI Monitoring', to: '/admin/ai', icon: Sparkles },
     { label: 'Duplicate Detection', to: '/admin/duplicates', icon: AlertTriangle },
+    { label: 'Notifications', to: '/admin/notifications', icon: Bell },
     { label: 'Citizens', to: '/admin/citizens', icon: Users },
     { label: 'Officers', to: '/admin/officers', icon: ShieldCheck },
     { label: 'Departments', to: '/admin/departments', icon: Building2 },
@@ -631,7 +633,7 @@ function DashboardLayout({ role }: { role: Role }) {
                 Workspace: {role}
               </div>
               <button aria-label="Open complaints" onClick={() => navigate(role === 'citizen' ? '/citizen/complaints' : role === 'officer' ? '/officer/assigned' : '/admin/complaints')} className="rounded-xl border border-slate-200 bg-white p-2"><Search size={18} /></button>
-              <button aria-label={`Open ${role === 'citizen' ? 'notifications' : 'activity'}`} onClick={() => navigate(role === 'citizen' ? '/citizen/notifications' : role === 'officer' ? '/officer/assigned' : '/admin/audit-logs')} className="relative rounded-xl border border-slate-200 bg-white p-2">
+              <button aria-label="Open notifications" onClick={() => navigate(`/${role}/notifications`)} className="relative rounded-xl border border-slate-200 bg-white p-2">
                 <Bell size={18} />
                 {unreadCount ? <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[9px] font-bold text-white">{unreadCount}</span> : null}
               </button>
@@ -645,17 +647,21 @@ function DashboardLayout({ role }: { role: Role }) {
                 <Route path="submit" element={<CitizenSubmitComplaint />} />
                 <Route path="complaints" element={<CitizenComplaints />} />
                 <Route path="track" element={<TrackComplaint />} />
-                <Route path="notifications" element={<CitizenNotifications />} />
+                <Route path="notifications" element={<PortalNotifications />} />
                 <Route path="profile" element={<CitizenProfile />} />
                 <Route path="help" element={<HelpSupport />} />
               </> : null}
               {role === 'officer' ? <>
                 <Route path="assigned" element={<OfficerAssignments />} />
+                <Route path="complaint" element={<TrackComplaint />} />
+                <Route path="notifications" element={<PortalNotifications />} />
                 <Route path="reports" element={<OfficerReports />} />
                 <Route path="profile" element={<CitizenProfile />} />
               </> : null}
               {role === 'admin' ? <>
                 <Route path="complaints" element={<AdminAllComplaints />} />
+                <Route path="complaint" element={<TrackComplaint />} />
+                <Route path="notifications" element={<PortalNotifications />} />
                 <Route path="ai" element={<AdminMonitoring />} />
                 <Route path="duplicates" element={<DuplicateReview />} />
                 <Route path="citizens" element={<CitizenManagement />} />
@@ -1216,7 +1222,9 @@ function CitizenComplaints() {
 function TrackComplaint() {
   const session = useAppStore((state) => state.session)
   const allComplaints = useAppStore((state) => state.complaints)
-  const complaints = allComplaints.filter((complaint) => complaint.citizenEmail === session?.email)
+  const complaints = session?.role === 'citizen'
+    ? allComplaints.filter((complaint) => complaint.citizenEmail === session.email)
+    : allComplaints
   const [searchParams, setSearchParams] = useSearchParams()
   const [query, setQuery] = useState(searchParams.get('complaint') ?? '')
   const selectedId = searchParams.get('complaint') ?? ''
@@ -1234,6 +1242,8 @@ function TrackComplaint() {
   const [feedbackRating, setFeedbackRating] = useState(5)
   const [feedbackComment, setFeedbackComment] = useState('')
   const [feedbackSubmitted, setFeedbackSubmitted] = useState(false)
+
+  useEffect(() => setFeedbackSubmitted(false), [selectedId])
 
   useEffect(() => {
     if (isDemoMode || !selectedComplaint?.recordId || (!selectedComplaint.imageIds?.length && !selectedComplaint.resolutionEvidenceIds?.length)) {
@@ -1285,7 +1295,6 @@ function TrackComplaint() {
     } catch (error) {
       toast.error(getApiErrorMessage(error, 'Feedback could not be submitted.'))
     }
-    useEffect(() => setFeedbackSubmitted(false), [selectedId])
   }
 
   return (
@@ -1386,16 +1395,20 @@ function TrackComplaint() {
   )
 }
 
-function CitizenNotifications() {
+function PortalNotifications() {
   const session = useAppStore((state) => state.session)
   const allComplaints = useAppStore((state) => state.complaints)
-  const complaintIds = allComplaints.filter((complaint) => complaint.citizenEmail === session?.email).map((complaint) => complaint.id)
+  const visibleComplaints = session?.role === 'citizen'
+    ? allComplaints.filter((complaint) => complaint.citizenEmail === session.email)
+    : allComplaints
+  const complaintIds = visibleComplaints.map((complaint) => complaint.id)
   const allNotifications = useAppStore((state) => state.notifications)
   const notifications = isDemoMode
     ? allNotifications.filter((item) => item.recipientEmail === session?.email || (!item.recipientEmail && item.complaintId && complaintIds.includes(item.complaintId)))
     : allNotifications
   const [filter, setFilter] = useState('All')
   const navigate = useNavigate()
+  const complaintPath = session?.role === 'citizen' ? '/citizen/track' : session?.role === 'officer' ? '/officer/complaint' : '/admin/complaint'
   const markRead = async (id: string) => {
     try { await notificationService.markAsRead(id) } catch (error) { toast.error(getApiErrorMessage(error, 'Notification could not be updated.')) }
   }
@@ -1405,7 +1418,7 @@ function CitizenNotifications() {
 
   return (
     <>
-      <SectionHeader eyebrow="Notifications" title="Updates and alerts" description="Stay informed about changes, assignments and decisions related to your complaints." action={<div className="flex gap-2"><select value={filter} onChange={(event) => setFilter(event.target.value)} className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"><option>All</option><option>Unread</option><option>Read</option></select><button className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => void markAllRead()}>Mark all as read</button></div>} />
+      <SectionHeader eyebrow="Notifications" title="Updates and alerts" description="Stay informed about changes, assignments and decisions related to your account." action={<div className="flex gap-2"><select value={filter} onChange={(event) => setFilter(event.target.value)} className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"><option>All</option><option>Unread</option><option>Read</option></select><button className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => void markAllRead()}>Mark all as read</button></div>} />
       <div className="space-y-4">
         {notifications.filter((item) => filter === 'All' || (filter === 'Unread' ? !item.read : item.read)).map((item) => (
           <div key={item.id} className={`rounded-2xl border p-4 shadow-sm ${item.read ? 'border-slate-200 bg-white' : 'border-blue-200 bg-blue-50'}`}>
@@ -1414,7 +1427,10 @@ function CitizenNotifications() {
                 <div className="text-xs uppercase tracking-[0.18em] text-slate-400">{item.type}</div>
                 <div className="mt-2 text-base font-semibold text-slate-800">{item.message}</div>
                 <div className="mt-2 text-xs text-slate-500">{formatDate(item.createdAt)}</div>
-                {item.complaintId ? <button onClick={() => navigate(`/citizen/track?complaint=${encodeURIComponent(item.complaintId!)}`)} className="mt-3 text-xs font-semibold text-blue-600">View complaint</button> : null}
+                {item.complaintId ? (() => {
+                  const complaint = allComplaints.find((candidate) => candidate.recordId === item.complaintId || candidate.id === item.complaintId)
+                  return complaint ? <button onClick={() => navigate(`${complaintPath}?complaint=${encodeURIComponent(complaint.id)}`)} className="mt-3 text-xs font-semibold text-blue-600">View complaint</button> : null
+                })() : null}
               </div>
               {!item.read ? (
                 <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700" onClick={() => void markRead(item.id)}>Mark read</button>
@@ -1589,6 +1605,7 @@ function OfficerOverview() {
 function OfficerAssignments() {
   const complaints = useAppStore((state) => state.complaints)
   const session = useAppStore((state) => state.session)
+  const navigate = useNavigate()
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('All')
   const [page, setPage] = useState(1)
@@ -1632,6 +1649,7 @@ function OfficerAssignments() {
                   <td className="py-3 pr-4">
                     <div className="font-semibold text-slate-900">{complaint.title}</div>
                     <div className="text-xs text-slate-500">{complaint.id}</div>
+                    <button onClick={() => navigate(`/officer/complaint?complaint=${encodeURIComponent(complaint.id)}`)} className="mt-1 text-xs font-semibold text-blue-600">View details and evidence</button>
                   </td>
                   <td className="py-3 pr-4 text-slate-700">{complaint.category}</td>
                   <td className="py-3 pr-4 text-slate-700">{complaint.city}</td>
@@ -1728,13 +1746,37 @@ function ResolutionEvidencePreview({ complaint }: { complaint: Complaint }) {
 
 function DuplicateReview() {
   const complaints = useAppStore((state) => state.complaints)
-  const [sourceId, setSourceId] = useState('')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const sourceId = searchParams.get('complaint') ?? ''
+  const setSourceId = (id: string) => {
+    const next = new URLSearchParams(searchParams)
+    if (id) next.set('complaint', id)
+    else next.delete('complaint')
+    setSearchParams(next, { replace: true })
+  }
   const [candidateId, setCandidateId] = useState('')
   const [decision, setDecision] = useState<'linked' | 'separate' | 'manual-review'>('manual-review')
   const [notes, setNotes] = useState('')
   const [busy, setBusy] = useState(false)
-  const [recentReviews, setRecentReviews] = useState<{ source: string; candidate: string; decision: string }[]>([])
+  const [recentReviews, setRecentReviews] = useState<{ source: string; candidate: string; decision: string; notes?: string | null; reviewer?: string; createdAt?: string }[]>([])
   const candidates = complaints.filter((item) => item.id !== sourceId)
+
+  useEffect(() => {
+    let active = true
+    setRecentReviews([])
+    if (!sourceId || isDemoMode) return () => { active = false }
+    void complaintService.getDuplicateReviews(sourceId).then((reviews) => {
+      if (active) setRecentReviews(reviews.map((review) => ({
+        source: review.complaint.trackingId,
+        candidate: review.candidate.trackingId,
+        decision: review.decision,
+        notes: review.notes,
+        reviewer: review.reviewer.email,
+        createdAt: review.createdAt,
+      })))
+    }).catch((error: unknown) => toast.error(getApiErrorMessage(error, 'Duplicate review history could not be loaded.')))
+    return () => { active = false }
+  }, [sourceId])
 
   const submitReview = async () => {
     if (!sourceId || !candidateId) {
@@ -1746,7 +1788,19 @@ function DuplicateReview() {
       await complaintService.reviewDuplicate(sourceId, decision, candidateId, notes.trim() || undefined)
       const source = complaints.find((item) => item.id === sourceId)
       const candidate = complaints.find((item) => item.id === candidateId)
-      setRecentReviews((items) => [{ source: source?.id ?? sourceId, candidate: candidate?.id ?? candidateId, decision }, ...items])
+      if (isDemoMode) {
+        setRecentReviews((items) => [{ source: source?.id ?? sourceId, candidate: candidate?.id ?? candidateId, decision, notes: notes.trim() || undefined }, ...items])
+      } else {
+        const reviews = await complaintService.getDuplicateReviews(sourceId)
+        setRecentReviews(reviews.map((review) => ({
+          source: review.complaint.trackingId,
+          candidate: review.candidate.trackingId,
+          decision: review.decision,
+          notes: review.notes,
+          reviewer: review.reviewer.email,
+          createdAt: review.createdAt,
+        })))
+      }
       setNotes('')
       toast.success('Manual duplicate review recorded.')
     } catch (error) {
@@ -1758,7 +1812,7 @@ function DuplicateReview() {
 
   return (
     <>
-      <SectionHeader eyebrow="Duplicate review" title="Manual duplicate review" description="Select two complaints and record an administrator decision. No similarity or fraud score is generated." />
+      <SectionHeader eyebrow="Duplicate review" title="Manual duplicate review" description="Automatic duplicate detection is unavailable. Select two existing complaints and record a manual decision; no similarity score or candidate is fabricated." />
       <div className="max-w-3xl rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
         <div className="grid gap-4 md:grid-cols-2">
           <label className="text-sm font-medium text-slate-700">Complaint
@@ -1787,7 +1841,7 @@ function DuplicateReview() {
         <button disabled={busy || complaints.length < 2} onClick={() => void submitReview()} className="mt-5 rounded-xl bg-navy px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{busy ? 'Saving…' : 'Record review'}</button>
         {complaints.length < 2 ? <p className="mt-3 text-sm text-slate-500">At least two complaints are required for manual comparison.</p> : null}
       </div>
-      {recentReviews.length ? <div className="mt-5 max-w-3xl space-y-2">{recentReviews.map((review, index) => <div key={`${review.source}-${index}`} className="rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-700">{review.source} ↔ {review.candidate} · {review.decision.replace('-', ' ')}</div>)}</div> : null}
+      {recentReviews.length ? <div className="mt-5 max-w-3xl space-y-2">{recentReviews.map((review, index) => <div key={`${review.source}-${review.candidate}-${review.createdAt ?? index}`} className="rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-700"><div>{review.source} ↔ {review.candidate} · {review.decision.replace(/_/g, ' ').replace('-', ' ')}</div>{review.notes ? <div className="mt-1 text-slate-500">{review.notes}</div> : null}{review.reviewer && review.createdAt ? <div className="mt-1 text-xs text-slate-400">Reviewed by {review.reviewer} · {formatDate(review.createdAt)}</div> : null}</div>)}</div> : sourceId ? <p className="mt-4 max-w-3xl text-sm text-slate-500">No duplicate review history for this complaint.</p> : null}
     </>
   )
 }
