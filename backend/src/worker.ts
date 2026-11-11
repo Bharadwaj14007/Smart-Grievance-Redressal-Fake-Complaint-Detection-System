@@ -4,6 +4,7 @@ import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import { env } from './config/env.js'
 import { prisma } from './config/prisma.js'
+import { getPrivateImage } from './services/storage.service.js'
 
 const analysisResponse = z.object({
   status: z.enum(['COMPLETED', 'NOT_CONFIGURED']),
@@ -14,16 +15,95 @@ async function analyzeComplaint(job: Job<{ complaintId: string }>) {
   if (!env.AI_SERVICE_URL) throw new Error('AI service is not configured.')
   const complaint = await prisma.complaint.findUnique({
     where: { id: job.data.complaintId },
-    select: { id: true, title: true, description: true, category: { select: { name: true } }, location: { select: { state: true, district: true, city: true } } },
+    select: {
+      id: true,
+      trackingId: true,
+      title: true,
+      description: true,
+      severity: true,
+      createdAt: true,
+      incidentAt: true,
+      category: { select: { id: true, name: true } },
+      location: { select: { state: true, district: true, city: true, latitude: true, longitude: true } },
+      images: { select: { id: true, contentType: true, objectKey: true } },
+    },
   })
   if (!complaint) throw new Error('Complaint no longer exists.')
   await prisma.aIAnalysis.updateMany({ where: { complaintId: complaint.id, status: 'QUEUED' }, data: { status: 'PROCESSING', error: null } })
 
+  const [categories, candidateRows, images] = await Promise.all([
+    prisma.complaintCategory.findMany({
+      where: { active: true },
+      select: { id: true, name: true, department: { select: { id: true, name: true } } },
+    }),
+    prisma.complaint.findMany({
+      where: { id: { not: complaint.id }, createdAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      select: {
+        id: true,
+        trackingId: true,
+        title: true,
+        description: true,
+        categoryId: true,
+        createdAt: true,
+        location: { select: { state: true, district: true, city: true, latitude: true, longitude: true } },
+        aiAnalyses: { where: { status: 'COMPLETED' }, orderBy: { createdAt: 'desc' }, take: 1, select: { result: true } },
+      },
+    }),
+    Promise.all(complaint.images.map(async (image) => {
+      const object = await getPrivateImage(image.objectKey)
+      const bytes = await object.Body?.transformToByteArray()
+      if (!bytes) throw new Error(`Could not read complaint image ${image.id} for AI analysis.`)
+      return { id: image.id, contentType: image.contentType, data: Buffer.from(bytes).toString('base64') }
+    })),
+  ])
+  const candidates = candidateRows.map((candidate) => {
+    const storedResult = candidate.aiAnalyses[0]?.result
+    const result = storedResult && typeof storedResult === 'object' && !Array.isArray(storedResult) ? storedResult : {}
+    const storedImages = Array.isArray(result.images) ? result.images : []
+    const imageRecords = storedImages.filter(
+      (image): image is Prisma.JsonObject => image !== null && typeof image === 'object' && !Array.isArray(image),
+    )
+    const textEmbedding = Array.isArray(result.textEmbedding) && result.textEmbedding.every((value) => typeof value === 'number')
+      ? result.textEmbedding as number[]
+      : undefined
+    const imageEmbeddings = imageRecords
+      .map((image) => image.embedding)
+      .filter((embedding): embedding is number[] => Array.isArray(embedding) && embedding.every((value) => typeof value === 'number'))
+    const perceptualHashes = imageRecords
+      .map((image) => image.perceptualHash)
+      .filter((hash): hash is string => typeof hash === 'string')
+    return {
+      id: candidate.id,
+      trackingId: candidate.trackingId,
+      title: candidate.title,
+      description: candidate.description,
+      categoryId: candidate.categoryId,
+      createdAt: candidate.createdAt.toISOString(),
+      location: candidate.location,
+      textEmbedding,
+      imageEmbeddings,
+      perceptualHashes,
+    }
+  })
   const response = await fetch(new URL('/v1/analyze', env.AI_SERVICE_URL), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(complaint),
-    signal: AbortSignal.timeout(30_000),
+    body: JSON.stringify({
+      ...complaint,
+      createdAt: complaint.createdAt.toISOString(),
+      incidentAt: complaint.incidentAt?.toISOString() ?? null,
+      categories: categories.map((category) => ({
+        id: category.id,
+        name: category.name,
+        departmentId: category.department?.id ?? null,
+        department: category.department?.name ?? null,
+      })),
+      candidates,
+      images,
+    }),
+    signal: AbortSignal.timeout(300_000),
   })
   if (!response.ok) throw new Error(`AI service returned HTTP ${response.status}.`)
   const output = analysisResponse.parse(await response.json())
@@ -39,7 +119,7 @@ async function analyzeComplaint(job: Job<{ complaintId: string }>) {
 
 if (!env.REDIS_URL) throw new Error('REDIS_URL is required to start the AI worker.')
 const connection = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null })
-const worker = new Worker('complaint-ai-analysis', analyzeComplaint, { connection, concurrency: 4 })
+const worker = new Worker('complaint-ai-analysis', analyzeComplaint, { connection, concurrency: 1 })
 const slaQueue = new Queue('complaint-sla-check', { connection })
 const slaWorker = new Worker('complaint-sla-check', async () => {
   const [complaints, configurations] = await Promise.all([

@@ -61,6 +61,12 @@ services:
 
   ai-service:
     build: ./ai-service
+    environment:
+      TEXT_MODEL_NAME: ${TEXT_MODEL_NAME:-sentence-transformers/all-MiniLM-L6-v2}
+      TEXT_MODEL_REVISION: ${TEXT_MODEL_REVISION:-main}
+      IMAGE_MODEL_NAME: ${IMAGE_MODEL_NAME:-google/vit-base-patch16-224}
+      IMAGE_MODEL_REVISION: ${IMAGE_MODEL_REVISION:-main}
+      DUPLICATE_SIMILARITY_THRESHOLD: ${DUPLICATE_SIMILARITY_THRESHOLD:-0.72}
     expose: ["8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
