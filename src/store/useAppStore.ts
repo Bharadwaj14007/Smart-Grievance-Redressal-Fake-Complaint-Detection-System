@@ -45,6 +45,10 @@ export type Complaint = {
   }
   createdAt: string
   lastUpdated: string
+  statusHistory?: { status: ComplaintStatus; message: string; createdAt: string }[]
+  resolutionImages?: string[]
+  duplicateGroupId?: string
+  duplicateDecision?: 'linked' | 'separate' | 'manual-review'
 }
 
 export type NotificationItem = {
@@ -54,6 +58,7 @@ export type NotificationItem = {
   read: boolean
   createdAt: string
   complaintId?: string
+  recipientEmail?: string
 }
 
 export type Department = {
@@ -76,6 +81,21 @@ export type Officer = {
   jurisdiction: string
   active: boolean
   workload: number
+  phone?: string
+  state?: string
+  district?: string
+  city?: string
+  address?: string
+  pincode?: string
+}
+
+export type ComplaintCategory = {
+  id: string
+  name: string
+  department: string
+  defaultPriority: 'Low' | 'Medium' | 'High' | 'Critical'
+  slaHours: number
+  active: boolean
 }
 
 export type CitizenProfile = {
@@ -88,6 +108,8 @@ export type CitizenProfile = {
   city: string
   joinedAt: string
   active: boolean
+  address?: string
+  pincode?: string
 }
 
 export type SessionUser = {
@@ -96,19 +118,50 @@ export type SessionUser = {
   role: Role
 }
 
+export type AuditEvent = {
+  id: string
+  actor: string
+  role: Role
+  action: string
+  relatedComplaintId?: string
+  createdAt: string
+  ipAddress: string
+}
+
+type DemoAccount = { email: string; password: string; name: string; role: Role }
+
 type AppState = {
   session: SessionUser | null
   complaints: Complaint[]
   notifications: NotificationItem[]
   departments: Department[]
+  categories: ComplaintCategory[]
+  prioritySlaHours: Record<Complaint['priority'], number>
   officers: Officer[]
   citizens: CitizenProfile[]
+  auditLogs: AuditEvent[]
+  demoAccounts: DemoAccount[]
   login: (email: string, password: string) => SessionUser | null
+  registerCitizen: (name: string, email: string, password: string) => { user: SessionUser | null; error?: string }
   logout: () => void
   createComplaint: (complaint: Omit<Complaint, 'id' | 'createdAt' | 'lastUpdated'>) => Complaint
+  updateProfile: (profile: Partial<CitizenProfile>) => void
   markNotificationRead: (id: string) => void
-  markAllNotificationsRead: () => void
+  markAllNotificationsRead: (recipientEmail?: string) => void
   updateComplaintStatus: (id: string, status: ComplaintStatus, officer?: string) => void
+  assignComplaint: (id: string, department: string, officer?: string) => void
+  addComplaintRemark: (id: string, remark: string) => void
+  addResolutionImage: (id: string, image: string) => void
+  reviewDuplicate: (id: string, decision: 'linked' | 'separate' | 'manual-review', matchId?: string) => void
+  setCitizenActive: (id: string, active: boolean) => void
+  saveOfficer: (officer: Omit<Officer, 'id'> & { id?: string }) => void
+  setOfficerActive: (id: string, active: boolean) => void
+  saveDepartment: (department: Omit<Department, 'id'> & { id?: string }) => void
+  deleteDepartment: (id: string) => void
+  saveCategory: (category: Omit<ComplaintCategory, 'id'> & { id?: string }) => void
+  deleteCategory: (id: string) => void
+  setPrioritySla: (priority: Complaint['priority'], hours: number) => void
+  addAuditEvent: (action: string, relatedComplaintId?: string) => void
   resetDemoData: () => void
 }
 
@@ -163,6 +216,14 @@ const seedOfficers: Officer[] = [
   { id: 'officer-1', name: 'Priya Sharma', email: 'officer@example.com', department: 'Municipal Corporation', jurisdiction: 'Gurugram East', active: true, workload: 14 },
   { id: 'officer-2', name: 'Amit Verma', email: 'amit@example.com', department: 'Roads & Transport', jurisdiction: 'Gurugram West', active: true, workload: 11 },
   { id: 'officer-3', name: 'Rhea Nair', email: 'rhea@example.com', department: 'Electrical Services', jurisdiction: 'Central Zone', active: true, workload: 9 },
+]
+
+const seedCategories: ComplaintCategory[] = [
+  { id: 'category-sanitation', name: 'Sanitation', department: 'Municipal Corporation', defaultPriority: 'Medium', slaHours: 72, active: true },
+  { id: 'category-street-lighting', name: 'Street Lighting', department: 'Electrical Services', defaultPriority: 'Medium', slaHours: 48, active: true },
+  { id: 'category-roads', name: 'Roads & Transport', department: 'Roads & Transport', defaultPriority: 'High', slaHours: 48, active: true },
+  { id: 'category-water', name: 'Water Supply', department: 'Water & Sanitation', defaultPriority: 'High', slaHours: 24, active: true },
+  { id: 'category-waste', name: 'Waste Management', department: 'Municipal Corporation', defaultPriority: 'Medium', slaHours: 72, active: true },
 ]
 
 const seedCitizens: CitizenProfile[] = [
@@ -307,23 +368,23 @@ const seedNotifications: NotificationItem[] = [
 ]
 
 const seedState = {
-  session: { email: 'citizen@example.com', name: 'Aarav Mehta', role: 'citizen' as Role },
+  session: null,
   complaints: seedComplaints,
   notifications: seedNotifications,
   departments: seedDepartments,
+  categories: seedCategories,
+  prioritySlaHours: { Critical: 12, High: 24, Medium: 72, Low: 120 },
   officers: seedOfficers,
   citizens: seedCitizens,
+  auditLogs: [] as AuditEvent[],
+  demoAccounts: [] as DemoAccount[],
 }
 
 export const useAppStore = create<AppState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       ...seedState,
       login: (email: string, password: string) => {
-        if (password !== 'Demo@123') {
-          return null
-        }
-
         const normalizedEmail = email.trim().toLowerCase()
         const roleMap: Record<string, Role> = {
           'citizen@example.com': 'citizen',
@@ -331,27 +392,71 @@ export const useAppStore = create<AppState>()(
           'admin@example.com': 'admin',
         }
 
-        const role = roleMap[normalizedEmail]
-        if (!role) return null
-
         const nameMap: Record<Role, string> = {
           citizen: 'Aarav Mehta',
           officer: 'Priya Sharma',
           admin: 'Rohan Kapoor',
         }
-
-        const session = { email: normalizedEmail, name: nameMap[role], role }
+        const role = roleMap[normalizedEmail]
+        const account = get().demoAccounts.find((item) => item.email === normalizedEmail)
+        let session: SessionUser
+        if (account && account.password === password) {
+          session = { email: account.email, name: account.name, role: account.role }
+        } else if (role && password === 'Demo@123') {
+          session = { email: normalizedEmail, name: nameMap[role], role }
+        } else {
+          return null
+        }
+        if (
+          (session.role === 'citizen' && get().citizens.some((citizen) => citizen.email === session.email && !citizen.active)) ||
+          (session.role === 'officer' && get().officers.some((officer) => officer.email === session.email && !officer.active))
+        ) return null
         set({ session })
         return session
       },
+      registerCitizen: (name, email, password) => {
+        const normalizedEmail = email.trim().toLowerCase()
+        if (get().citizens.some((citizen) => citizen.email === normalizedEmail) || get().demoAccounts.some((account) => account.email === normalizedEmail)) {
+          return { user: null, error: 'An account with this email already exists.' }
+        }
+        if (name.trim().length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail) || password.length < 8) {
+          return { user: null, error: 'Provide a valid name, email and password of at least 8 characters.' }
+        }
+        const user: SessionUser = { email: normalizedEmail, name: name.trim(), role: 'citizen' }
+        set((state) => ({
+          session: user,
+          demoAccounts: [...state.demoAccounts, { ...user, password }],
+          citizens: [...state.citizens, {
+            id: crypto.randomUUID(),
+            name: user.name,
+            email: user.email,
+            phone: '',
+            state: '',
+            district: '',
+            city: '',
+            joinedAt: new Date().toISOString(),
+            active: true,
+          }],
+        }))
+        return { user }
+      },
       logout: () => set({ session: null }),
       createComplaint: (complaintInput) => {
+        const now = new Date().toISOString()
+        const year = new Date(now).getFullYear()
+        const prefix = `GRV-${year}-`
+        const latestSequence = get().complaints.reduce((max, existing) => {
+          if (!existing.id.startsWith(prefix)) return max
+          const sequence = Number(existing.id.slice(prefix.length))
+          return Number.isFinite(sequence) ? Math.max(max, sequence) : max
+        }, 0)
         const complaint: Complaint = {
           ...complaintInput,
-          id: `GRV-${new Date().getFullYear()}-${String(Math.floor(Math.random() * 9000) + 1000)}`,
-          createdAt: new Date().toISOString(),
-          lastUpdated: new Date().toISOString(),
+          id: `${prefix}${String(latestSequence + 1).padStart(6, '0')}`,
+          createdAt: now,
+          lastUpdated: now,
           remarks: complaintInput.remarks.length ? complaintInput.remarks : ['Complaint filed and awaiting routing.'],
+          statusHistory: [{ status: 'Pending', message: 'Complaint submitted.', createdAt: now }],
         }
 
         set((state) => ({
@@ -362,14 +467,52 @@ export const useAppStore = create<AppState>()(
               type: 'info',
               message: `Your complaint ${complaint.id} was submitted successfully.`,
               read: false,
-              createdAt: new Date().toISOString(),
+              createdAt: now,
               complaintId: complaint.id,
+              recipientEmail: complaint.citizenEmail,
             },
             ...state.notifications,
           ],
         }))
+        get().addAuditEvent('Submitted complaint', complaint.id)
 
         return complaint
+      },
+      updateProfile: (profile) => {
+        const session = get().session
+        if (!session) return
+        const currentCitizen = get().citizens.find((citizen) => citizen.email === session.email)
+        const currentOfficer = get().officers.find((officer) => officer.email === session.email)
+        const updatedCitizen = currentCitizen ? {
+          ...currentCitizen,
+          name: profile.name?.trim() || currentCitizen.name,
+          phone: profile.phone ?? currentCitizen.phone,
+          address: profile.address ?? currentCitizen.address,
+          state: profile.state ?? currentCitizen.state,
+          district: profile.district ?? currentCitizen.district,
+          city: profile.city ?? currentCitizen.city,
+          pincode: profile.pincode ?? currentCitizen.pincode,
+        } : undefined
+        const updatedOfficer = currentOfficer ? {
+          ...currentOfficer,
+          name: profile.name?.trim() || currentOfficer.name,
+          phone: profile.phone ?? currentOfficer.phone,
+          address: profile.address ?? currentOfficer.address,
+          state: profile.state ?? currentOfficer.state,
+          district: profile.district ?? currentOfficer.district,
+          city: profile.city ?? currentOfficer.city,
+          pincode: profile.pincode ?? currentOfficer.pincode,
+        } : undefined
+        const updatedName = profile.name?.trim() || session.name
+        set((state) => ({
+          session: { ...session, name: updatedName },
+          citizens: updatedCitizen ? state.citizens.map((citizen) => citizen.id === updatedCitizen.id ? updatedCitizen : citizen) : state.citizens,
+          officers: updatedOfficer ? state.officers.map((officer) => officer.id === updatedOfficer.id ? updatedOfficer : officer) : state.officers,
+          complaints: currentOfficer && currentOfficer.name !== updatedName
+            ? state.complaints.map((complaint) => complaint.assignedOfficer === currentOfficer.name ? { ...complaint, assignedOfficer: updatedName } : complaint)
+            : state.complaints,
+        }))
+        get().addAuditEvent('Updated profile')
       },
       markNotificationRead: (id: string) => {
         set((state) => ({
@@ -378,12 +521,20 @@ export const useAppStore = create<AppState>()(
           ),
         }))
       },
-      markAllNotificationsRead: () => {
+      markAllNotificationsRead: (recipientEmail) => {
         set((state) => ({
-          notifications: state.notifications.map((item) => ({ ...item, read: true })),
+          notifications: state.notifications.map((item) => {
+            if (!recipientEmail) return { ...item, read: true }
+            const belongsToRecipient = item.recipientEmail === recipientEmail ||
+              (!item.recipientEmail && item.complaintId && state.complaints.some((complaint) => complaint.id === item.complaintId && complaint.citizenEmail === recipientEmail))
+            return belongsToRecipient ? { ...item, read: true } : item
+          }),
         }))
       },
       updateComplaintStatus: (id: string, status: ComplaintStatus, officer?: string) => {
+        if (!get().complaints.some((complaint) => complaint.id === id)) return
+        const now = new Date().toISOString()
+        const actor = get().session
         set((state) => ({
           complaints: state.complaints.map((complaint) =>
             complaint.id === id
@@ -391,11 +542,223 @@ export const useAppStore = create<AppState>()(
                   ...complaint,
                   status,
                   assignedOfficer: officer ?? complaint.assignedOfficer,
-                  lastUpdated: new Date().toISOString(),
+                  lastUpdated: now,
                   remarks: [...complaint.remarks, `Status updated to ${status}.`],
+                  statusHistory: [...(complaint.statusHistory ?? []), { status, message: `Status updated to ${status}.`, createdAt: now }],
                 }
               : complaint,
           ),
+          notifications: actor?.role === 'citizen' ? state.notifications : [
+            {
+              id: crypto.randomUUID(),
+              type: status === 'Resolved' ? 'success' : 'info',
+              message: `Complaint ${id} status changed to ${status}.`,
+              read: false,
+              createdAt: now,
+              complaintId: id,
+              recipientEmail: state.complaints.find((complaint) => complaint.id === id)?.citizenEmail,
+            },
+            ...state.notifications,
+          ],
+        }))
+        const complaint = get().complaints.find((item) => item.id === id)
+        if (complaint) get().addAuditEvent(`Changed complaint status to ${status}`, id)
+      },
+      assignComplaint: (id, department, officer) => {
+        const existing = get().complaints.find((complaint) => complaint.id === id)
+        if (!existing) return
+        const selectedOfficer = officer ?? (
+          department === existing.department
+            ? existing.assignedOfficer
+            : get().officers.find((item) => item.active && item.department === department)?.name ?? 'Unassigned'
+        )
+        const now = new Date().toISOString()
+        const message = `Assigned to ${department}${selectedOfficer === 'Unassigned' ? '' : ` · ${selectedOfficer}`}.`
+        set((state) => ({
+          complaints: state.complaints.map((complaint) => complaint.id === id ? {
+            ...complaint,
+            department,
+            assignedOfficer: selectedOfficer,
+            status: selectedOfficer === 'Unassigned' ? complaint.status : 'Assigned',
+            lastUpdated: now,
+            remarks: [...complaint.remarks, message],
+            statusHistory: [...(complaint.statusHistory ?? []), {
+              status: selectedOfficer === 'Unassigned' ? complaint.status : 'Assigned',
+              message,
+              createdAt: now,
+            }],
+          } : complaint),
+          notifications: [{
+            id: crypto.randomUUID(),
+            type: 'info',
+            message: `Complaint ${id} was routed to ${department}.`,
+            read: false,
+            createdAt: now,
+            complaintId: id,
+            recipientEmail: existing.citizenEmail,
+          }, ...state.notifications],
+        }))
+        get().addAuditEvent(`Assigned complaint to ${department}`, id)
+      },
+      addComplaintRemark: (id, remark) => {
+        if (!get().complaints.some((complaint) => complaint.id === id)) return
+        const now = new Date().toISOString()
+        set((state) => ({
+          complaints: state.complaints.map((complaint) => complaint.id === id
+            ? {
+                ...complaint,
+                remarks: [...complaint.remarks, remark],
+                lastUpdated: now,
+                statusHistory: [...(complaint.statusHistory ?? []), { status: complaint.status, message: remark, createdAt: now }],
+              }
+            : complaint),
+        }))
+        get().addAuditEvent('Added investigation remark', id)
+      },
+      addResolutionImage: (id, image) => {
+        const now = new Date().toISOString()
+        if (!get().complaints.some((complaint) => complaint.id === id)) return
+        set((state) => ({
+          complaints: state.complaints.map((complaint) => complaint.id === id
+            ? {
+                ...complaint,
+                resolutionImages: [...(complaint.resolutionImages ?? []), image],
+                lastUpdated: now,
+                remarks: [...complaint.remarks, 'Resolution evidence uploaded.'],
+                statusHistory: [...(complaint.statusHistory ?? []), { status: complaint.status, message: 'Resolution evidence uploaded.', createdAt: now }],
+              }
+            : complaint),
+        }))
+        get().addAuditEvent('Uploaded resolution evidence', id)
+      },
+      reviewDuplicate: (id, decision, matchId) => {
+        const complaint = get().complaints.find((item) => item.id === id)
+        if (!complaint) return
+        let groupId = complaint.duplicateGroupId
+        if (decision === 'linked') {
+          const match = matchId ? get().complaints.find((item) => item.id === matchId) : undefined
+          if (!match || match.id === id) throw new Error('Choose a different complaint to link.')
+          groupId = groupId ?? match.duplicateGroupId ?? crypto.randomUUID()
+        }
+        const now = new Date().toISOString()
+        const message = decision === 'linked'
+          ? `Duplicate review: linked to ${matchId} as the same incident.`
+          : decision === 'separate'
+            ? 'Duplicate review: marked as a separate issue after manual review.'
+            : 'Duplicate review: forwarded for manual assessment.'
+        set((state) => ({
+          complaints: state.complaints.map((item) => {
+            if (item.id === id || (decision === 'linked' && item.id === matchId)) {
+              return {
+                ...item,
+                duplicateDecision: decision,
+                ...(decision === 'linked' ? { duplicateGroupId: groupId } : {}),
+                remarks: [...item.remarks, message],
+                lastUpdated: now,
+                statusHistory: [...(item.statusHistory ?? []), { status: item.status, message, createdAt: now }],
+              }
+            }
+            return item
+          }),
+        }))
+        get().addAuditEvent(`Recorded duplicate review: ${decision}`, id)
+      },
+      setCitizenActive: (id, active) => {
+        set((state) => ({ citizens: state.citizens.map((citizen) => citizen.id === id ? { ...citizen, active } : citizen) }))
+        get().addAuditEvent(`${active ? 'Activated' : 'Deactivated'} citizen account`)
+      },
+      saveOfficer: (officer) => {
+        const id = officer.id ?? crypto.randomUUID()
+        if (get().officers.some((item) => item.id !== id && item.email.toLowerCase() === officer.email.trim().toLowerCase())) {
+          throw new Error('An officer with this email already exists.')
+        }
+        set((state) => ({
+          officers: officer.id
+            ? state.officers.map((item) => item.id === id ? { ...officer, id } : item)
+            : [...state.officers, { ...officer, id }],
+        }))
+        get().addAuditEvent(`${officer.id ? 'Updated' : 'Created'} officer`)
+      },
+      setOfficerActive: (id, active) => {
+        set((state) => ({ officers: state.officers.map((officer) => officer.id === id ? { ...officer, active } : officer) }))
+        get().addAuditEvent(`${active ? 'Activated' : 'Deactivated'} officer`)
+      },
+      saveDepartment: (department) => {
+        const id = department.id ?? crypto.randomUUID()
+        const existing = department.id ? get().departments.find((item) => item.id === department.id) : undefined
+        if (get().departments.some((item) => item.id !== id && (item.name.toLowerCase() === department.name.trim().toLowerCase() || item.code.toLowerCase() === department.code.trim().toLowerCase()))) {
+          throw new Error('Department name and code must be unique.')
+        }
+        set((state) => ({
+          departments: department.id
+            ? state.departments.map((item) => item.id === id ? { ...department, id } : item)
+            : [...state.departments, { ...department, id }],
+          ...(existing && existing.name !== department.name ? {
+            officers: state.officers.map((item) => item.department === existing.name ? { ...item, department: department.name } : item),
+            categories: state.categories.map((item) => item.department === existing.name ? { ...item, department: department.name } : item),
+            complaints: state.complaints.map((item) => item.department === existing.name ? { ...item, department: department.name } : item),
+          } : {}),
+        }))
+        get().addAuditEvent(`${department.id ? 'Updated' : 'Created'} department`)
+      },
+      deleteDepartment: (id) => {
+        const department = get().departments.find((item) => item.id === id)
+        if (!department) return
+        if (
+          get().complaints.some((complaint) => complaint.department === department.name) ||
+          get().officers.some((officer) => officer.department === department.name) ||
+          get().categories.some((category) => category.department === department.name)
+        ) {
+          throw new Error('Cannot delete a department assigned to complaints, officers, or categories.')
+        }
+        set((state) => ({ departments: state.departments.filter((item) => item.id !== id) }))
+        get().addAuditEvent('Deleted department')
+      },
+      saveCategory: (category) => {
+        const id = category.id ?? crypto.randomUUID()
+        const existing = category.id ? get().categories.find((item) => item.id === category.id) : undefined
+        if (get().categories.some((item) => item.id !== id && item.name.toLowerCase() === category.name.trim().toLowerCase())) {
+          throw new Error('Category name must be unique.')
+        }
+        set((state) => ({
+          categories: category.id
+            ? state.categories.map((item) => item.id === id ? { ...category, id } : item)
+            : [...state.categories, { ...category, id }],
+          ...(existing && existing.name !== category.name ? {
+            complaints: state.complaints.map((item) => item.category === existing.name
+              ? { ...item, category: category.name, ai: { ...item.ai, predictedCategory: category.name } }
+              : item),
+          } : {}),
+        }))
+        get().addAuditEvent(`${category.id ? 'Updated' : 'Created'} complaint category`)
+      },
+      deleteCategory: (id) => {
+        const category = get().categories.find((item) => item.id === id)
+        if (!category) return
+        if (get().complaints.some((complaint) => complaint.category === category.name)) {
+          throw new Error('Cannot delete a category used by complaint records.')
+        }
+        set((state) => ({ categories: state.categories.filter((item) => item.id !== id) }))
+        get().addAuditEvent('Deleted complaint category')
+      },
+      setPrioritySla: (priority, hours) => {
+        if (!Number.isFinite(hours) || hours < 1) throw new Error('SLA must be at least one hour.')
+        set((state) => ({ prioritySlaHours: { ...state.prioritySlaHours, [priority]: hours } }))
+        get().addAuditEvent(`Updated ${priority} priority SLA to ${hours} hours`)
+      },
+      addAuditEvent: (action, relatedComplaintId) => {
+        const actor = get().session
+        if (!actor) return
+        set((state) => ({
+          auditLogs: [{
+            id: crypto.randomUUID(),
+            actor: actor.name,
+            role: actor.role,
+            action,
+            relatedComplaintId,
+            createdAt: new Date().toISOString(),
+            ipAddress: '192.0.2.10',
+          }, ...state.auditLogs],
         }))
       },
       resetDemoData: () => set({ ...seedState }),
@@ -407,8 +770,12 @@ export const useAppStore = create<AppState>()(
         complaints: state.complaints,
         notifications: state.notifications,
         departments: state.departments,
+        categories: state.categories,
+        prioritySlaHours: state.prioritySlaHours,
         officers: state.officers,
         citizens: state.citizens,
+        auditLogs: state.auditLogs,
+        demoAccounts: state.demoAccounts,
       }),
     },
   ),
