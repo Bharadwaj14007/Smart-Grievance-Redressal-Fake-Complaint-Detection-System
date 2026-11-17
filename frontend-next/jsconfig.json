@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "baseUrl": "..",
+    "checkJs": false,
+    "jsx": "preserve",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["app/**/*.js", "app/**/*.jsx", "src/**/*.js", "src/**/*.jsx"]
+}

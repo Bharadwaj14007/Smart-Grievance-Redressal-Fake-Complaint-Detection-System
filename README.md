@@ -1,6 +1,6 @@
 # Nagrik Setu
 
-Nagrik Setu is a grievance-redressal portal with React/Vite and Next.js frontends, an Express/TypeScript API, PostgreSQL/PostGIS data model, private object storage, Redis job queues, and a pretrained-model AI service.
+Nagrik Setu is a grievance-redressal portal with React/Vite and Next.js frontends, a JavaScript Express API, PostgreSQL/PostGIS data model, authenticated Cloudinary image storage, Redis job queues, and AI analysis through Google Gemini and the included pretrained-model service.
 
 ## Run the portal
 
@@ -30,7 +30,7 @@ cp .env.example .env
 cp backend/.env.example backend/.env
 ```
 
-`backend/.env` must contain distinct `JWT_SECRET` and `REFRESH_TOKEN_SECRET` values of at least 32 characters. Keep both `.env` files out of version control. `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD`, `SEED_ADMIN_PASSWORD`, and the two token secrets must not be reused.
+`backend/.env` must contain distinct `JWT_SECRET` and `REFRESH_TOKEN_SECRET` values of at least 32 characters. Configure Cloudinary and Gemini credentials there; replace the example placeholders with valid provider credentials. Keep both `.env` files out of version control. `POSTGRES_PASSWORD`, `SEED_ADMIN_PASSWORD`, and the two token secrets must not be reused.
 
 Start the services and migrate the database:
 
@@ -42,16 +42,16 @@ docker compose exec api npm run db:deploy
 Seed the baseline department/category and an administrator account. Use the same `SEED_ADMIN_EMAIL` and `SEED_ADMIN_PASSWORD` values configured in `backend/.env`:
 
 ```sh
-docker compose exec api npm run db:seed:compiled
+docker compose exec api npm run db:seed
 ```
 
-The Vite portal is available at `http://localhost:8080`, the Next.js portal at `http://localhost:3000`, and API documentation at `http://localhost:8080/docs`. PostgreSQL/PostGIS, Redis, and MinIO are exposed only on localhost at ports 5432, 6379, 9000, and 9001. Persisted data is stored in named Compose volumes. MinIO initialization creates a private bucket and a scoped service account for the API. Apply migrations after the database starts and before using the API or worker; the migration set enables PostGIS, stores/backfills complaint points, and creates spatial indexes.
+The Vite portal is available at `http://localhost:8080`, the Next.js portal at `http://localhost:3000`, and API documentation at `http://localhost:8080/docs`. PostgreSQL/PostGIS and Redis are exposed only on localhost at ports 5432 and 6379. Database and queue data are stored in named Compose volumes. New complaint images and officer/resolution evidence are uploaded server-side to Cloudinary as authenticated assets and are served through role-authorized API routes; no Cloudinary secret is sent to either frontend. Existing S3/MinIO image records remain readable when the optional `STORAGE_*` settings are configured. For the bundled legacy MinIO service, set `STORAGE_ENDPOINT=http://minio:9000`, `STORAGE_BUCKET=nagrik-private`, and the `STORAGE_ACCESS_KEY`/`STORAGE_SECRET_KEY` values to match `MINIO_APP_USER`/`MINIO_APP_PASSWORD` in the root `.env`, then run `docker compose --profile legacy-storage up`. Existing objects are not copied to Cloudinary automatically. Apply migrations after the database starts and before using the API or worker; the migration set enables PostGIS, stores/backfills complaint points, and creates spatial indexes.
 
-The AI worker is wired to the included FastAPI service. On first analysis, the service downloads the configured public Sentence Transformers text model and Hugging Face ViT image classifier; set `TEXT_MODEL_NAME`, `TEXT_MODEL_REVISION`, `IMAGE_MODEL_NAME`, and `IMAGE_MODEL_REVISION` in the root `.env` to select alternatives. Model downloads require outbound access to Hugging Face and are cached in the container only; no AI API key is required for the default public models. Complaint text is analyzed against active categories, and actual nearby complaints are retrieved through PostGIS before weighted text/date/distance signals rank duplicate candidates. `DUPLICATE_SIMILARITY_THRESHOLD` controls candidate reporting and `DUPLICATE_SEARCH_RADIUS_KM` controls geographic retrieval and proximity scoring. Supplied images receive general classification, embeddings, perceptual-hash, metadata, OpenCV quality, and recompression-difference analysis. Results are advisory, not calibrated probabilities, and require human review; image signals do not establish fraud or authenticity. Rule-based safety terms may recommend a critical priority, with the original citizen severity retained unless a human changes it.
+The AI worker sends complaint text and a bounded set of nearby existing complaint records to Gemini when `GEMINI_API_KEY` is configured (`GEMINI_MODEL` defaults to `gemini-flash-latest`). The key is sent to Google in the `X-goog-api-key` header and is never exposed to a frontend. Gemini output is schema-validated, constrained to active categories/departments and real candidate records, and persisted in the existing AI analysis record. Model suggestions and confidence are advisory, confidence is not calibrated, and human review is required; the model is not asked to determine fraud. The included FastAPI service remains available for text/image embeddings and heuristic duplicate ranking. It downloads the configured public Sentence Transformers text model and Hugging Face ViT image classifier on first analysis; set `TEXT_MODEL_NAME`, `TEXT_MODEL_REVISION`, `IMAGE_MODEL_NAME`, and `IMAGE_MODEL_REVISION` in the root `.env` to select alternatives. If Gemini is unavailable, the worker records a clear failure status and complaint submission continues; the existing analysis service can still supply its independent results.
 
 In-app notifications are always persisted. SMTP and Twilio SMS delivery are optional and require complete provider settings in `backend/.env` (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, and `SMS_ACCOUNT_SID`, `SMS_AUTH_TOKEN`, `SMS_FROM`). When credentials are absent, deliveries are marked `NOT_CONFIGURED`; they are not reported as sent. Configured deliveries are retried by the worker and administrators can review delivery status and errors in the portal.
 
-For production, deploy behind HTTPS, set `COOKIE_SECURE=true`, configure `TRUST_PROXY` only for the actual trusted proxy topology, provide managed Postgres/Redis/private S3-compatible storage, rotate strong secrets, and review the service's authentication, retention, backup, monitoring, and operational policies before accepting real complaint data. The included Compose defaults are development-only.
+For production, deploy behind HTTPS, set `COOKIE_SECURE=true`, configure `TRUST_PROXY` only for the actual trusted proxy topology, provide managed Postgres/Redis and valid Cloudinary/Gemini credentials, rotate strong secrets, and review the service's authentication, retention, backup, monitoring, and operational policies before accepting real complaint data. The included Compose defaults are development-only.
 
 ## API overview
 
@@ -63,7 +63,7 @@ The API is versioned under `/api/v1`:
 - `/notifications`: current-user notifications and read state.
 - `/admin`: officer/citizen administration, departments, categories, SLA settings, audit records, reports, AI monitoring, provider-delivery logs and duplicate-review decisions.
 
-Access and rotating refresh tokens are set as `HttpOnly` cookies. API mutations validate request bodies, enforce role/ownership checks, and write audit events. Images are validated by file signature, capped at 512 KiB per image, stored without public access, and served only after complaint authorization. Interactive OpenAPI documentation and the machine-readable specification are served at `/docs` and `/api/openapi.json`.
+Access and rotating refresh tokens are set as `HttpOnly` cookies. API mutations validate request bodies, enforce role/ownership checks, and write audit events. Images are validated by file signature, capped at 512 KiB per image, uploaded as authenticated Cloudinary assets, and served only after complaint authorization through the API. Interactive OpenAPI documentation and the machine-readable specification are served at `/docs` and `/api/openapi.json`.
 
 ## Backend development
 
@@ -87,7 +87,7 @@ cd backend
 npm run worker:dev
 ```
 
-Validate the schema, types and request validation tests with:
+Validate the Prisma schema and run the request and integration tests with:
 
 ```sh
 cd backend

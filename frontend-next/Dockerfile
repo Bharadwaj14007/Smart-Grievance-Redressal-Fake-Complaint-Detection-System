@@ -5,7 +5,6 @@ ENV BACKEND_URL=${BACKEND_URL}
 COPY frontend-next/package*.json ./
 RUN npm ci
 COPY frontend-next/ ./
-COPY shared/ /app/shared/
 ENV NODE_ENV=production
 RUN npm run build
 EXPOSE 3000
