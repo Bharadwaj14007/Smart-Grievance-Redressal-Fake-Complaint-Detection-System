@@ -23,7 +23,7 @@ app.use(cookieParser());
 app.get('/healthz', (_req, res) => res.status(200).json({ status: 'ok' }));
 app.get('/readyz', async (_req, res) => {
     try {
-        await prisma.$queryRaw `SELECT 1`;
+        await prisma.$runCommandRaw({ ping: 1 });
         res.status(200).json({ status: 'ready' });
     }
     catch (error) {

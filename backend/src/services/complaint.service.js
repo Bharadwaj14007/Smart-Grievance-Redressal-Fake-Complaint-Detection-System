@@ -137,7 +137,6 @@ export async function getComplaintForUser(req, id) {
 export async function updateStatus(req, id, nextStatus, note) {
     await getComplaintForUser(req, id);
     const result = await prisma.$transaction(async (tx) => {
-        await tx.$queryRaw `SELECT id FROM complaints WHERE id = ${id}::uuid FOR UPDATE`;
         const current = await tx.complaint.findUnique({ where: { id } });
         if (!current)
             throw new HttpError(404, 'Complaint not found.');
@@ -196,7 +195,6 @@ export async function assignComplaint(req, id, officerId, departmentId) {
     if (!department)
         throw new HttpError(400, 'A department must be selected for assignment.');
     return prisma.$transaction(async (tx) => {
-        await tx.$queryRaw `SELECT id FROM complaints WHERE id = ${id}::uuid FOR UPDATE`;
         const current = await tx.complaint.findUnique({ where: { id } });
         if (!current)
             throw new HttpError(404, 'Complaint not found.');

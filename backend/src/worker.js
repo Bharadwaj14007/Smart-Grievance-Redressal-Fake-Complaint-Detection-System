@@ -6,10 +6,12 @@ import { prisma } from './config/prisma.js';
 import { getPrivateImage } from './services/storage.service.js';
 import { analyzeComplaintWithGemini } from './services/gemini.service.js';
 import { createNotification, deliverPendingNotifications } from './services/notification-delivery.service.js';
+import { distanceKm } from './utils/geo.js';
 const analysisResponse = z.object({
     status: z.literal('COMPLETED'),
     result: z.record(z.string(), z.unknown()).nullable(),
 });
+
 async function analyzeComplaint(job) {
     if (!env.aiConfigured)
         throw new Error('No AI provider is configured.');
@@ -43,32 +45,59 @@ async function analyzeComplaint(job) {
     });
     if (!started.count)
         return;
-    const [categories, spatialCandidateIds, images] = await Promise.all([
+    const radiusKm = env.DUPLICATE_SEARCH_RADIUS_KM;
+    const referenceDate = complaint.incidentAt ?? complaint.createdAt;
+    const startDate = new Date(referenceDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const endDate = new Date(referenceDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const latitude = Number(complaint.location?.latitude);
+    const longitude = Number(complaint.location?.longitude);
+    const latitudeDelta = radiusKm / 110.574;
+    const longitudeDelta = Math.min(180, radiusKm / (111.32 * Math.max(Math.abs(Math.cos(latitude * Math.PI / 180)), 0.00001)));
+    const west = longitude - longitudeDelta;
+    const east = longitude + longitudeDelta;
+    const longitudeFilter = longitudeDelta >= 180
+        ? {}
+        : west < -180
+          ? { OR: [{ longitude: { gte: west + 360 } }, { longitude: { lte: east } }] }
+          : east > 180
+            ? { OR: [{ longitude: { gte: west } }, { longitude: { lte: east - 360 } }] }
+            : { longitude: { gte: west, lte: east } };
+    const [categories, nearbyCandidates, images] = await Promise.all([
         prisma.complaintCategory.findMany({
             where: { active: true },
             select: { id: true, name: true, department: { select: { id: true, name: true } } },
         }),
-        prisma.$queryRaw `
-      SELECT candidate.id
-      FROM complaints candidate
-      JOIN complaint_locations candidate_location ON candidate_location.complaint_id = candidate.id
-      JOIN complaint_locations source_location ON source_location.complaint_id = ${complaint.id}::uuid
-      JOIN complaints source ON source.id = source_location.complaint_id
-      WHERE candidate.id <> ${complaint.id}::uuid
-        AND COALESCE(candidate.incident_at, candidate.created_at) BETWEEN
-          COALESCE(source.incident_at, source.created_at) - INTERVAL '30 days'
-          AND COALESCE(source.incident_at, source.created_at) + INTERVAL '30 days'
-        AND ST_DWithin(
-          candidate_location.location_geom::geography,
-          source_location.location_geom::geography,
-          ${env.DUPLICATE_SEARCH_RADIUS_KM * 1000}
-        )
-      ORDER BY ST_Distance(
-        candidate_location.location_geom::geography,
-        source_location.location_geom::geography
-      ), candidate.created_at DESC
-      LIMIT 100
-    `,
+        complaint.location
+            ? prisma.complaint.findMany({
+                where: {
+                  id: { not: complaint.id },
+                  OR: [
+                    { incidentAt: { gte: startDate, lte: endDate } },
+                    { incidentAt: null, createdAt: { gte: startDate, lte: endDate } },
+                  ],
+                  location: {
+                    is: {
+                      latitude: { gte: latitude - latitudeDelta, lte: latitude + latitudeDelta },
+                      ...longitudeFilter,
+                    },
+                  },
+                },
+                orderBy: { createdAt: 'desc' },
+                take: 1000,
+                select: {
+                  id: true,
+                  trackingId: true,
+                  title: true,
+                  description: true,
+                  categoryId: true,
+                  category: { select: { name: true } },
+                  createdAt: true,
+                  incidentAt: true,
+                  location: { select: { state: true, district: true, city: true, latitude: true, longitude: true } },
+                  aiAnalyses: { where: { status: 'COMPLETED' }, orderBy: { createdAt: 'desc' }, take: 1, select: { result: true } },
+                },
+              })
+            : Promise.resolve([]),
         env.AI_SERVICE_URL
             ? Promise.all(complaint.images.map(async (image) => {
                 const bytes = await getPrivateImage(image.objectKey, image.contentType);
@@ -76,25 +105,13 @@ async function analyzeComplaint(job) {
             })).catch(() => null)
             : Promise.resolve([]),
     ]);
-    const candidateRows = spatialCandidateIds.length
-        ? await prisma.complaint.findMany({
-            where: { id: { in: spatialCandidateIds.map(({ id }) => id) } },
-            select: {
-                id: true,
-                trackingId: true,
-                title: true,
-                description: true,
-                categoryId: true,
-                category: { select: { name: true } },
-                createdAt: true,
-                incidentAt: true,
-                location: { select: { state: true, district: true, city: true, latitude: true, longitude: true } },
-                aiAnalyses: { where: { status: 'COMPLETED' }, orderBy: { createdAt: 'desc' }, take: 1, select: { result: true } },
-            },
-        })
-        : [];
-    const candidateOrder = new Map(spatialCandidateIds.map(({ id }, index) => [id, index]));
-    candidateRows.sort((left, right) => (candidateOrder.get(left.id) ?? 0) - (candidateOrder.get(right.id) ?? 0));
+    const candidateRows = nearbyCandidates
+        .filter((candidate) => candidate.location && distanceKm(complaint.location, candidate.location) <= radiusKm)
+        .sort((left, right) =>
+            distanceKm(complaint.location, left.location) - distanceKm(complaint.location, right.location)
+            || right.createdAt.getTime() - left.createdAt.getTime(),
+        )
+        .slice(0, 100);
     const candidates = candidateRows.map((candidate) => {
         const storedResult = candidate.aiAnalyses[0]?.result;
         const result = storedResult && typeof storedResult === 'object' && !Array.isArray(storedResult) ? storedResult : {};

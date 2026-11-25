@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "mongodb"
   url      = env("DATABASE_URL")
 }
 
@@ -59,117 +59,117 @@ enum NotificationDeliveryStatus {
 }
 
 model User {
-  id              String          @id @default(uuid()) @db.Uuid
-  email           String          @unique @db.VarChar(320)
-  passwordHash    String          @map("password_hash")
-  role            Role
-  status          AccountStatus   @default(ACTIVE)
-  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
-  citizenProfile  CitizenProfile?
-  officerProfile  OfficerProfile?
-  complaints      Complaint[]     @relation("ComplaintCitizen")
-  assignments     ComplaintAssignment[]
-  notes           InvestigationNote[]
-  notifications   Notification[]
-  feedback        Feedback[]
-  duplicateReviews DuplicateReview[] @relation("DuplicateReviewer")
-  auditLogs       AuditLog[]
-  sessions        RefreshToken[]
+  id               String                @id @default(uuid()) @map("_id")
+  email            String                @unique
+  passwordHash     String                @map("password_hash")
+  role             Role
+  status           AccountStatus         @default(ACTIVE)
+  createdAt        DateTime              @default(now()) @map("created_at")
+  updatedAt        DateTime              @updatedAt @map("updated_at")
+  citizenProfile   CitizenProfile?
+  officerProfile   OfficerProfile?
+  complaints       Complaint[]           @relation("ComplaintCitizen")
+  assignments      ComplaintAssignment[]
+  notes            InvestigationNote[]
+  notifications    Notification[]
+  feedback         Feedback[]
+  duplicateReviews DuplicateReview[]     @relation("DuplicateReviewer")
+  auditLogs        AuditLog[]
+  sessions         RefreshToken[]
 
   @@index([role, status])
   @@map("users")
 }
 
 model CitizenProfile {
-  id        String   @id @default(uuid()) @db.Uuid
-  userId    String   @unique @map("user_id") @db.Uuid
-  fullName  String   @map("full_name") @db.VarChar(160)
-  phone     String?  @db.VarChar(32)
-  address   String?
-  state     String?  @db.VarChar(100)
-  district  String?  @db.VarChar(100)
-  city      String?  @db.VarChar(100)
-  pincode   String?  @db.VarChar(12)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id       String  @id @default(uuid()) @map("_id")
+  userId   String  @unique @map("user_id")
+  fullName String  @map("full_name")
+  phone    String?
+  address  String?
+  state    String?
+  district String?
+  city     String?
+  pincode  String?
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("citizen_profiles")
 }
 
 model OfficerProfile {
-  id           String       @id @default(uuid()) @db.Uuid
-  userId       String       @unique @map("user_id") @db.Uuid
-  fullName     String       @map("full_name") @db.VarChar(160)
-  departmentId String?      @map("department_id") @db.Uuid
+  id           String      @id @default(uuid()) @map("_id")
+  userId       String      @unique @map("user_id")
+  fullName     String      @map("full_name")
+  departmentId String?     @map("department_id")
   jurisdiction String?
-  phone        String?      @db.VarChar(32)
-  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  department   Department?  @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  phone        String?
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  department   Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
 
   @@index([departmentId])
   @@map("officer_profiles")
 }
 
 model Department {
-  id          String           @id @default(uuid()) @db.Uuid
-  name        String           @unique @db.VarChar(160)
-  code        String           @unique @db.VarChar(32)
-  description String?
-  state       String?          @db.VarChar(100)
-  district    String?          @db.VarChar(100)
+  id           String                @id @default(uuid()) @map("_id")
+  name         String                @unique
+  code         String                @unique
+  description  String?
+  state        String?
+  district     String?
   jurisdiction String?
-  active      Boolean          @default(true)
-  officers    OfficerProfile[]
-  categories  ComplaintCategory[]
-  complaints  Complaint[]
-  assignments ComplaintAssignment[]
+  active       Boolean               @default(true)
+  officers     OfficerProfile[]
+  categories   ComplaintCategory[]
+  complaints   Complaint[]
+  assignments  ComplaintAssignment[]
 
   @@map("departments")
 }
 
 model ComplaintCategory {
-  id             String       @id @default(uuid()) @db.Uuid
-  name           String       @unique @db.VarChar(120)
-  departmentId   String?      @map("department_id") @db.Uuid
-  defaultPriority Priority    @default(MEDIUM) @map("default_priority")
-  slaHours       Int          @default(72) @map("sla_hours")
-  active         Boolean      @default(true)
-  department     Department?  @relation(fields: [departmentId], references: [id], onDelete: SetNull)
-  complaints     Complaint[]
-  sla            SLAConfiguration[]
+  id              String             @id @default(uuid()) @map("_id")
+  name            String             @unique
+  departmentId    String?            @map("department_id")
+  defaultPriority Priority           @default(MEDIUM) @map("default_priority")
+  slaHours        Int                @default(72) @map("sla_hours")
+  active          Boolean            @default(true)
+  department      Department?        @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  complaints      Complaint[]
+  sla             SLAConfiguration[]
 
   @@map("complaint_categories")
 }
 
 model Complaint {
-  id             String               @id @default(uuid()) @db.Uuid
-  trackingId     String               @unique @map("tracking_id") @db.VarChar(40)
-  citizenId      String               @map("citizen_id") @db.Uuid
-  categoryId     String               @map("category_id") @db.Uuid
-  departmentId   String?              @map("department_id") @db.Uuid
-  title          String               @db.VarChar(200)
-  description    String
-  severity       Priority
-  priority       Priority             @default(MEDIUM)
-  status         ComplaintStatus      @default(SUBMITTED)
-  incidentAt    DateTime?            @map("incident_at") @db.Timestamptz(6)
-  consent        Boolean              @default(false)
-  createdAt      DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt      DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
-  citizen        User                 @relation("ComplaintCitizen", fields: [citizenId], references: [id], onDelete: Restrict)
-  category       ComplaintCategory    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
-  department     Department?          @relation(fields: [departmentId], references: [id], onDelete: SetNull)
-  images         ComplaintImage[]
-  location       ComplaintLocation?
-  assignments    ComplaintAssignment[]
-  notes          InvestigationNote[]
-  resolutionEvidence ResolutionEvidence[]
-  history        ComplaintStatusHistory[]
-  notifications  Notification[]
-  feedback       Feedback?
-  duplicateReviews DuplicateReview[] @relation("ComplaintDuplicateReview")
-  duplicateCandidates DuplicateReview[] @relation("DuplicateCandidate")
-  aiAnalyses     AIAnalysis[]
+  id                  String                   @id @default(uuid()) @map("_id")
+  trackingId          String                   @unique @map("tracking_id")
+  citizenId           String                   @map("citizen_id")
+  categoryId          String                   @map("category_id")
+  departmentId        String?                  @map("department_id")
+  title               String
+  description         String
+  severity            Priority
+  priority            Priority                 @default(MEDIUM)
+  status              ComplaintStatus          @default(SUBMITTED)
+  incidentAt          DateTime?                @map("incident_at")
+  consent             Boolean                  @default(false)
+  createdAt           DateTime                 @default(now()) @map("created_at")
+  updatedAt           DateTime                 @updatedAt @map("updated_at")
+  citizen             User                     @relation("ComplaintCitizen", fields: [citizenId], references: [id], onDelete: Restrict)
+  category            ComplaintCategory        @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  department          Department?              @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  images              ComplaintImage[]
+  location            ComplaintLocation?
+  assignments         ComplaintAssignment[]
+  notes               InvestigationNote[]
+  resolutionEvidence  ResolutionEvidence[]
+  history             ComplaintStatusHistory[]
+  notifications       Notification[]
+  feedback            Feedback?
+  duplicateReviews    DuplicateReview[]        @relation("ComplaintDuplicateReview")
+  duplicateCandidates DuplicateReview[]        @relation("DuplicateCandidate")
+  aiAnalyses          AIAnalysis[]
 
   @@index([citizenId, createdAt])
   @@index([status, priority, createdAt])
@@ -179,43 +179,43 @@ model Complaint {
 }
 
 model ComplaintImage {
-  id          String     @id @default(uuid()) @db.Uuid
-  complaintId String     @map("complaint_id") @db.Uuid
-  objectKey   String     @unique @map("object_key")
-  contentType String     @map("content_type") @db.VarChar(100)
-  sizeBytes   Int        @map("size_bytes")
-  checksum    String?    @db.VarChar(128)
-  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
-  complaint   Complaint  @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  id          String    @id @default(uuid()) @map("_id")
+  complaintId String    @map("complaint_id")
+  objectKey   String    @unique @map("object_key")
+  contentType String    @map("content_type")
+  sizeBytes   Int       @map("size_bytes")
+  checksum    String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  complaint   Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
 
   @@index([complaintId])
   @@map("complaint_images")
 }
 
 model ComplaintLocation {
-  complaintId String     @id @map("complaint_id") @db.Uuid
+  complaintId String    @id @map("_id")
   address     String
-  state       String     @db.VarChar(100)
-  district    String     @db.VarChar(100)
-  city        String     @db.VarChar(100)
-  pincode     String     @db.VarChar(12)
-  latitude    Decimal    @db.Decimal(10, 7)
-  longitude   Decimal    @db.Decimal(10, 7)
-  complaint   Complaint  @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  state       String
+  district    String
+  city        String
+  pincode     String
+  latitude    Float
+  longitude   Float
+  complaint   Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
 
   @@index([state, district, city])
   @@map("complaint_locations")
 }
 
 model ComplaintAssignment {
-  id           String      @id @default(uuid()) @db.Uuid
-  complaintId  String      @map("complaint_id") @db.Uuid
-  officerId    String      @map("officer_id") @db.Uuid
-  departmentId String?     @map("department_id") @db.Uuid
-  assignedById String?     @map("assigned_by_id") @db.Uuid
+  id           String      @id @default(uuid()) @map("_id")
+  complaintId  String      @map("complaint_id")
+  officerId    String      @map("officer_id")
+  departmentId String?     @map("department_id")
+  assignedById String?     @map("assigned_by_id")
   active       Boolean     @default(true)
-  assignedAt   DateTime    @default(now()) @map("assigned_at") @db.Timestamptz(6)
-  endedAt      DateTime?   @map("ended_at") @db.Timestamptz(6)
+  assignedAt   DateTime    @default(now()) @map("assigned_at")
+  endedAt      DateTime?   @map("ended_at")
   complaint    Complaint   @relation(fields: [complaintId], references: [id], onDelete: Cascade)
   officer      User        @relation(fields: [officerId], references: [id], onDelete: Restrict)
   department   Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
@@ -226,55 +226,55 @@ model ComplaintAssignment {
 }
 
 model InvestigationNote {
-  id          String     @id @default(uuid()) @db.Uuid
-  complaintId String     @map("complaint_id") @db.Uuid
-  authorId    String     @map("author_id") @db.Uuid
+  id          String    @id @default(uuid()) @map("_id")
+  complaintId String    @map("complaint_id")
+  authorId    String    @map("author_id")
   body        String
-  isPublic    Boolean    @default(false) @map("is_public")
-  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
-  complaint   Complaint  @relation(fields: [complaintId], references: [id], onDelete: Cascade)
-  author      User       @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  isPublic    Boolean   @default(false) @map("is_public")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  complaint   Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  author      User      @relation(fields: [authorId], references: [id], onDelete: Restrict)
 
   @@index([complaintId, createdAt])
   @@map("investigation_notes")
 }
 
 model ResolutionEvidence {
-  id          String     @id @default(uuid()) @db.Uuid
-  complaintId String     @map("complaint_id") @db.Uuid
-  objectKey   String     @unique @map("object_key")
-  contentType String     @map("content_type") @db.VarChar(100)
-  sizeBytes   Int        @map("size_bytes")
-  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
-  complaint   Complaint  @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  id          String    @id @default(uuid()) @map("_id")
+  complaintId String    @map("complaint_id")
+  objectKey   String    @unique @map("object_key")
+  contentType String    @map("content_type")
+  sizeBytes   Int       @map("size_bytes")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  complaint   Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
 
   @@map("resolution_evidence")
 }
 
 model ComplaintStatusHistory {
-  id          String          @id @default(uuid()) @db.Uuid
-  complaintId String          @map("complaint_id") @db.Uuid
+  id          String           @id @default(uuid()) @map("_id")
+  complaintId String           @map("complaint_id")
   fromStatus  ComplaintStatus? @map("from_status")
-  toStatus    ComplaintStatus @map("to_status")
+  toStatus    ComplaintStatus  @map("to_status")
   note        String?
-  actorId     String?         @map("actor_id") @db.Uuid
-  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  complaint   Complaint       @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  actorId     String?          @map("actor_id")
+  createdAt   DateTime         @default(now()) @map("created_at")
+  complaint   Complaint        @relation(fields: [complaintId], references: [id], onDelete: Cascade)
 
   @@index([complaintId, createdAt])
   @@map("complaint_status_history")
 }
 
 model Notification {
-  id          String      @id @default(uuid()) @db.Uuid
-  userId      String      @map("user_id") @db.Uuid
-  complaintId String?     @map("complaint_id") @db.Uuid
-  type        String      @db.VarChar(60)
+  id          String                 @id @default(uuid()) @map("_id")
+  userId      String                 @map("user_id")
+  complaintId String?                @map("complaint_id")
+  type        String
   message     String
-  readAt      DateTime?   @map("read_at") @db.Timestamptz(6)
-  createdAt   DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
-  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  complaint   Complaint?  @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  readAt      DateTime?              @map("read_at")
+  createdAt   DateTime               @default(now()) @map("created_at")
+  user        User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  complaint   Complaint?             @relation(fields: [complaintId], references: [id], onDelete: Cascade)
   deliveries  NotificationDelivery[]
 
   @@index([userId, readAt, createdAt])
@@ -282,16 +282,16 @@ model Notification {
 }
 
 model NotificationDelivery {
-  id                String                     @id @default(uuid()) @db.Uuid
-  notificationId    String                     @map("notification_id") @db.Uuid
+  id                String                     @id @default(uuid()) @map("_id")
+  notificationId    String                     @map("notification_id")
   channel           NotificationChannel
   status            NotificationDeliveryStatus @default(QUEUED)
   attemptCount      Int                        @default(0) @map("attempt_count")
-  nextAttemptAt     DateTime                   @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  nextAttemptAt     DateTime                   @default(now()) @map("next_attempt_at")
   providerMessageId String?                    @map("provider_message_id")
   error             String?
-  createdAt         DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt         DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdAt         DateTime                   @default(now()) @map("created_at")
+  updatedAt         DateTime                   @updatedAt @map("updated_at")
   notification      Notification               @relation(fields: [notificationId], references: [id], onDelete: Cascade)
 
   @@unique([notificationId, channel])
@@ -300,44 +300,44 @@ model NotificationDelivery {
 }
 
 model Feedback {
-  id          String     @id @default(uuid()) @db.Uuid
-  complaintId String     @unique @map("complaint_id") @db.Uuid
-  citizenId   String     @map("citizen_id") @db.Uuid
+  id          String    @id @default(uuid()) @map("_id")
+  complaintId String    @unique @map("complaint_id")
+  citizenId   String    @map("citizen_id")
   rating      Int
   comment     String?
-  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
-  complaint   Complaint  @relation(fields: [complaintId], references: [id], onDelete: Cascade)
-  citizen     User       @relation(fields: [citizenId], references: [id], onDelete: Restrict)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  complaint   Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  citizen     User      @relation(fields: [citizenId], references: [id], onDelete: Restrict)
 
   @@map("feedback")
 }
 
 model DuplicateReview {
-  id            String     @id @default(uuid()) @db.Uuid
-  complaintId   String     @map("complaint_id") @db.Uuid
-  candidateId   String     @map("candidate_id") @db.Uuid
-  reviewerId    String     @map("reviewer_id") @db.Uuid
-  decision      String     @db.VarChar(40)
-  similarity    Decimal?   @db.Decimal(5, 4)
-  notes         String?
-  createdAt     DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
-  complaint     Complaint  @relation("ComplaintDuplicateReview", fields: [complaintId], references: [id], onDelete: Cascade)
-  candidate     Complaint  @relation("DuplicateCandidate", fields: [candidateId], references: [id], onDelete: Cascade)
-  reviewer      User       @relation("DuplicateReviewer", fields: [reviewerId], references: [id], onDelete: Restrict)
+  id          String    @id @default(uuid()) @map("_id")
+  complaintId String    @map("complaint_id")
+  candidateId String    @map("candidate_id")
+  reviewerId  String    @map("reviewer_id")
+  decision    String
+  similarity  Float?
+  notes       String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  complaint   Complaint @relation("ComplaintDuplicateReview", fields: [complaintId], references: [id], onDelete: Cascade)
+  candidate   Complaint @relation("DuplicateCandidate", fields: [candidateId], references: [id], onDelete: Cascade)
+  reviewer    User      @relation("DuplicateReviewer", fields: [reviewerId], references: [id], onDelete: Restrict)
 
   @@index([complaintId, createdAt])
   @@map("duplicate_reviews")
 }
 
 model AuditLog {
-  id         String   @id @default(uuid()) @db.Uuid
-  actorId    String?  @map("actor_id") @db.Uuid
-  action     String   @db.VarChar(120)
-  entityType String   @map("entity_type") @db.VarChar(80)
-  entityId   String?  @map("entity_id") @db.Uuid
+  id         String   @id @default(uuid()) @map("_id")
+  actorId    String?  @map("actor_id")
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
   metadata   Json?
-  ipAddress  String?  @map("ip_address") @db.VarChar(64)
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
   actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
 
   @@index([actorId, createdAt])
@@ -346,39 +346,39 @@ model AuditLog {
 }
 
 model SLAConfiguration {
-  id          String            @id @default(uuid()) @db.Uuid
-  categoryId  String?           @map("category_id") @db.Uuid
-  priority    Priority?
-  responseHours Int             @map("response_hours")
-  resolutionHours Int           @map("resolution_hours")
-  active      Boolean           @default(true)
-  category    ComplaintCategory? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  id              String             @id @default(uuid()) @map("_id")
+  categoryId      String?            @map("category_id")
+  priority        Priority?
+  responseHours   Int                @map("response_hours")
+  resolutionHours Int                @map("resolution_hours")
+  active          Boolean            @default(true)
+  category        ComplaintCategory? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
 
   @@index([categoryId, priority, active])
   @@map("sla_configurations")
 }
 
 model AIAnalysis {
-  id          String       @id @default(uuid()) @db.Uuid
-  complaintId String       @map("complaint_id") @db.Uuid
-  status      AIJobStatus  @default(QUEUED)
+  id          String      @id @default(uuid()) @map("_id")
+  complaintId String      @map("complaint_id")
+  status      AIJobStatus @default(QUEUED)
   result      Json?
   error       String?
-  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
-  complaint   Complaint    @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+  complaint   Complaint   @relation(fields: [complaintId], references: [id], onDelete: Cascade)
 
   @@index([status, createdAt])
   @@map("ai_analyses")
 }
 
 model RefreshToken {
-  id        String    @id @default(uuid()) @db.Uuid
-  userId    String    @map("user_id") @db.Uuid
+  id        String    @id @default(uuid()) @map("_id")
+  userId    String    @map("user_id")
   tokenHash String    @unique @map("token_hash")
-  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
-  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, revokedAt, expiresAt])
@@ -386,8 +386,8 @@ model RefreshToken {
 }
 
 model TrackingSequence {
-  year  Int    @id
-  value Int    @default(0)
+  year  Int @id @map("_id")
+  value Int @default(0)
 
   @@map("tracking_sequences")
 }
