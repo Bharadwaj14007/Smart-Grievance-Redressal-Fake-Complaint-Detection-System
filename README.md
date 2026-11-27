@@ -11,6 +11,12 @@ npm run dev
 
 The portal uses the API by default. It expects the API at `/api/v1`; set `VITE_API_BASE_URL` when the API is hosted elsewhere. To run the UI without the backend, start Vite with `VITE_DEMO_MODE=true` in the environment. Demo mode is development-only and uses in-memory sample data; authentication and portal data are not persisted in browser storage.
 
+### Production API routing
+
+The Vite `/api` proxy in `vite.config.js` is for local development only. A production deployment must route `/api/v1/*` to the Express API. The included Docker image does this through `nginx.conf` when the API is reachable as `api:4000` on the same Docker network. If the frontend and API are deployed separately, set `VITE_API_BASE_URL` in the frontend's **build-time** environment to the public API base URL ending in `/api/v1` (for example, `https://api.example.com/api/v1`) and rebuild/redeploy the frontend. For the Docker build, this can be passed as `--build-arg VITE_API_BASE_URL=https://api.example.com/api/v1`.
+
+Set the backend's `FRONTEND_URL` to the exact deployed frontend origin. The browser uses credentialed HTTP-only cookies, so deploy both behind HTTPS and preferably on the same site; cross-site cookie restrictions can prevent sign-in even when the API URL is reachable. A 404 on `/api/v1/auth/me` means the request is reaching a host/path without the API route; verify the proxy or API base URL before retrying.
+
 To run the API locally, start MongoDB as a single-node replica set (the API uses transactions). With MongoDB Community installed:
 
 ```sh

@@ -31,6 +31,8 @@ export function getApiErrorMessage(error, fallback = 'The request could not be c
         const data = error.response?.data;
         if (typeof data?.message === 'string')
             return data.message;
+        if (error.response?.status === 404)
+            return 'The API endpoint was not found. Set VITE_API_BASE_URL to your deployed API ending in /api/v1, or configure your host to proxy /api/v1 to the backend.';
         if (!error.response)
             return 'The service could not be reached. Check your connection and try again.';
     }

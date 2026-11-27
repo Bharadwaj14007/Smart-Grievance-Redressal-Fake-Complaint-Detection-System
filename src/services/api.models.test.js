@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { mapComplaint, toApiStatus } from './api.models';
+import { getApiErrorMessage } from './api';
 describe('complaint API mapping', () => {
     it('maps detail timeline, evidence, and persisted feedback', () => {
         const complaint = mapComplaint({
@@ -21,6 +22,17 @@ describe('complaint API mapping', () => {
             images: [{ id: 'image-1' }],
             resolutionEvidence: [{ id: 'evidence-1' }],
             feedback: { rating: 4, comment: 'Resolved promptly.', createdAt: '2026-01-04T10:00:00.000Z' },
+        });
+
+        describe('API errors', () => {
+            it('explains how to fix an API 404 in production', () => {
+                const error = {
+                    isAxiosError: true,
+                    response: { status: 404, data: '<!doctype html>' },
+                };
+                expect(getApiErrorMessage(error)).toContain('VITE_API_BASE_URL');
+                expect(getApiErrorMessage(error)).toContain('proxy /api/v1');
+            });
         });
         expect(complaint.id).toBe('GRV-2026-000001');
         expect(complaint.recordId).toBe('record-1');
