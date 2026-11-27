@@ -50,7 +50,15 @@ npm ci
 BACKEND_URL=http://localhost:4000 npm run dev
 ```
 
-It proxies API requests through the same origin and uses the API's `HttpOnly` session cookies; access tokens are not stored in browser storage.
+During local development it proxies API requests to the local backend. In production, `/api/v1/*` is routed by the root Vercel services configuration when the Next.js frontend is made public, and the frontend uses the API's `HttpOnly` session cookies; access tokens are not stored in browser storage.
+
+## Deploy on Vercel
+
+The root `vercel.json` defines Vercel services for the Vite app, FastAPI analysis service, Express API, and Next.js frontend. The Vite app is the public site at `/`; `/api/*` routes to the API. The Next.js frontend and AI service stay internal by default. The API and its background worker use service bindings to call the AI service. A Vercel daemon runs the BullMQ worker in `iad1`.
+
+Vercel Services and Daemons are currently beta features. Configure `DATABASE_URL` for a MongoDB replica set (such as MongoDB Atlas), `REDIS_URL` for a reachable Redis service, and the required JWT secrets in Vercel's project environment settings. Add provider credentials as needed for Cloudinary, Gemini, email, and SMS. The background worker needs the same database, Redis, and provider environment values as the API. Vercel does not provide MongoDB or Redis in this configuration.
+
+The AI service installs PyTorch, Transformers, and OpenCV and downloads pretrained models at runtime. Check Vercel's current Python function limits and service plan before deploying; this dependency/model footprint may require a container-based or external AI service instead. The `frontend-next` service is included but not public in the default routing; use the Vite `app` service for `/`. Review and confirm the service names, public routes, worker region, and bindings before deploying.
 
 ## Optional containerized setup
 

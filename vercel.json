@@ -1,0 +1,66 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "app": {
+      "root": ".",
+      "framework": "vite"
+    },
+    "ai-service": {
+      "root": "ai-service",
+      "framework": "fastapi",
+      "entrypoint": "app.main:app"
+    },
+    "backend": {
+      "root": "backend",
+      "framework": "express",
+      "buildCommand": "npm run build",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "ai-service",
+          "format": "url",
+          "env": "AI_SERVICE_URL"
+        }
+      ]
+    },
+    "frontend-next": {
+      "root": "frontend-next",
+      "framework": "nextjs"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "app"
+      }
+    }
+  ],
+  "daemons": {
+    "worker": {
+      "root": "backend",
+      "entrypoint": "Dockerfile",
+      "command": [
+        "node",
+        "src/worker.js"
+      ],
+      "instances": {
+        "iad1": 1
+      },
+      "bindings": [
+        {
+          "type": "service",
+          "service": "ai-service",
+          "format": "url",
+          "env": "AI_SERVICE_URL"
+        }
+      ]
+    }
+  }
+}
