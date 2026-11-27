@@ -7,8 +7,16 @@
     },
     "ai-service": {
       "root": "ai-service",
-      "framework": "fastapi",
-      "entrypoint": "app.main:app"
+      "runtime": "container",
+      "entrypoint": "Dockerfile",
+      "command": [
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "80"
+      ]
     },
     "backend": {
       "root": "backend",

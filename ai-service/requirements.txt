@@ -1,8 +1,10 @@
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
 pydantic==2.11.4
 sentence-transformers==4.1.0
-torch==2.6.0
+torch==2.6.0+cpu
 numpy==1.26.4
 transformers==4.51.3
 Pillow==11.2.1
